@@ -61,20 +61,30 @@ function logError(msg, extra = {}) {
  * We keep /workspace/.claude/CLAUDE.md and other non-session config because
  * it's customer-authored project rules, not state.
  */
-function cleanStaleSessionState() {
-	const sessionsDir = '/workspace/.claude/sessions';
+function wipeClaudeState() {
+	// HOME for the `agent` user is /workspace (Dockerfile useradd --home-dir),
+	// so ~/.claude resolves into the persistent Fly Volume. Claude stores
+	// per-project session state under .claude/projects/<hash>/sessions/<id>.jsonl.
+	// If a prior turn died mid-run, the lockfile/state survives and the next
+	// turn errors with "Session ID X is already in use". Wipe the whole
+	// .claude dir before each turn — auth credentials are re-written by
+	// configureCcAuth right after.
+	//
+	// Note: project files in /workspace/* (NOT under .claude/) are untouched;
+	// CLAUDE.md and similar live at the project root, not under .claude/, so
+	// they survive.
+	const homeDir = process.env.HOME || '/workspace';
+	const ccDir = path.join(homeDir, '.claude');
 	try {
-		fs.rmSync(sessionsDir, { recursive: true, force: true });
+		fs.rmSync(ccDir, { recursive: true, force: true });
 	} catch (err) {
-		// Best-effort. If we can't, claude may still fail with "in use" — but at
-		// least try.
-		logError('failed to clean .claude/sessions', { msg: err && err.message });
+		logError('failed to wipe .claude state', { msg: err && err.message });
 	}
 }
 
-/** Configure Claude Code OAuth credentials before exec'ing claude. */
+/** Configure Claude Code OAuth credentials. Call AFTER wipeClaudeState. */
 function configureCcAuth(token) {
-	const homeDir = process.env.HOME || '/root';
+	const homeDir = process.env.HOME || '/workspace';
 	const ccDir = path.join(homeDir, '.claude');
 	fs.mkdirSync(ccDir, { recursive: true, mode: 0o700 });
 	fs.writeFileSync(
@@ -173,8 +183,9 @@ const server = http.createServer(async (req, res) => {
 		if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
+			// Order matters: wipe FIRST (kills stale state), then write fresh creds.
+			wipeClaudeState();
 			configureCcAuth(envelope.ccToken);
-			cleanStaleSessionState();
 			const args = buildClaudeArgs(envelope);
 			await runProc('claude', args, res, emit);
 		} else if (mode === 'build' || mode === 'exec') {
