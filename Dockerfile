@@ -29,9 +29,14 @@ ARG CC_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VERSION}" \
  && npm cache clean --force
 
-# Entrypoint script. Read-only at runtime.
+# Entrypoint script (legacy stdin-pipe path) + HTTP server (preferred path).
 COPY --chown=root:root --chmod=0755 entrypoint.sh /opt/smoothagent/entrypoint.sh
 COPY --chown=root:root --chmod=0644 contract.json /opt/smoothagent/contract.json
+COPY --chown=root:root --chmod=0755 server.js /opt/smoothagent/server.js
+
+# HTTP server port. Runner spawns the machine with init.cmd pointing at server.js;
+# Fly routes app traffic to this port via [services] config.
+EXPOSE 8080
 
 # Default workspace is the mount point Fly Volume / Docker volume hits.
 WORKDIR /workspace
@@ -40,6 +45,17 @@ WORKDIR /workspace
 # but we set USER too for any standalone / docker-run usage.
 USER agent
 
-# tini handles SIGTERM correctly so graceful shutdown of CC subprocess works.
+# Two entry modes (selected by Fly init.cmd or `docker run` cmd):
+#
+#   1. HTTP server (production):
+#      init.cmd = ["/usr/local/bin/node", "/opt/smoothagent/server.js"]
+#      → Listens on :8080, accepts POST /run with envelope JSON,
+#        streams claude output back chunked.
+#
+#   2. Legacy stdin-pipe (smoke tests, docker run -i):
+#      no override → ENTRYPOINT below runs entrypoint.sh which reads
+#      stdin envelope and exits. Used by test/smoke.sh.
+#
+# tini handles SIGTERM so claude / node child processes shut down cleanly.
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/smoothagent/entrypoint.sh"]
 CMD []
