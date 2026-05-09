@@ -1,0 +1,15 @@
+# Local builds
+*.tar
+*.tar.gz
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local secrets — must NEVER be committed
+.env
+.env.*
+*.pem
+*.key
+.credentials.json

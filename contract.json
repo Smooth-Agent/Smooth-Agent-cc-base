@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SmoothAgent cc-base entrypoint contract",
+  "description": "Wire format the entrypoint accepts on stdin and emits on stdout.",
+  "version": "1.0.0",
+
+  "input": {
+    "type": "object",
+    "description": "Single JSON object on stdin. Max 1 MiB.",
+    "required": ["mode"],
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["cc-cli", "build", "exec"],
+        "description": "Execution mode. cc-cli runs Claude Code with a prompt; build/exec run an arbitrary argv."
+      },
+      "prompt": { "type": "string", "description": "User prompt (required when mode=cc-cli)." },
+      "ccToken": {
+        "type": "string",
+        "description": "Claude Code OAuth access token (required when mode=cc-cli). Written to ~/.claude/.credentials.json with mode 600. Never logged."
+      },
+      "model": { "type": "string", "description": "Optional model id, e.g. claude-sonnet-4-6." },
+      "sessionId": { "type": "string", "description": "Optional CC session id to resume." },
+      "systemPrompt": { "type": "string", "description": "Optional system prompt (passed via --system-prompt)." },
+      "maxTurns": { "type": "integer", "description": "Optional max agent turns." },
+      "mcpConfig": {
+        "type": "object",
+        "description": "Optional MCP server config (written to a temp file and passed via --mcp-config)."
+      },
+      "cmd": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "argv for build/exec modes. Executed without a shell unless the first element is a shell."
+      },
+      "env": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Environment overrides exported before execution."
+      }
+    }
+  },
+
+  "output": {
+    "description": "Newline-delimited JSON events on stdout. Each event has the shape {type, data, ts}.",
+    "events": {
+      "ready": {
+        "description": "Emitted as soon as the entrypoint validates input and is about to dispatch.",
+        "data": { "mode": "string", "cwd": "string" }
+      },
+      "build_start": {
+        "description": "Emitted when mode=build|exec begins running the customer cmd.",
+        "data": { "cmd": ["string"] }
+      },
+      "log": {
+        "description": "One line of stdout/stderr from the customer cmd (build|exec only).",
+        "data": { "line": "string" }
+      },
+      "build_done": {
+        "description": "Emitted when the customer cmd exits.",
+        "data": { "exitCode": "integer" }
+      },
+      "error": {
+        "description": "Emitted on validation failure. Process then exits non-zero.",
+        "data": { "code": "string", "message": "string" }
+      }
+    },
+    "passthrough": {
+      "description": "When mode=cc-cli, the Claude Code CLI streams its own stream-json events directly. The entrypoint emits only the leading 'ready' event and then execs claude, so all subsequent stdout lines are CC's native event format. The runner unwraps these and re-emits them in its own SSE protocol."
+    }
+  },
+
+  "exit_codes": {
+    "0": "Success.",
+    "1": "Validation error or unrecoverable runtime error. See last 'error' event for details.",
+    "non-zero": "When mode=build|exec, the exit code of the customer cmd is propagated."
+  },
+
+  "filesystem": {
+    "/workspace": "Mounted by runner from a per-(user, project) volume. Writable by user 996. Persists across turns.",
+    "/cc": "Read-only mount of cc runtime helpers (when runner injects extra tools). Optional.",
+    "/opt/smoothagent": "Image-bundled scripts and contract. Read-only.",
+    "/tmp": "tmpfs. Cleared on container exit."
+  },
+
+  "security": {
+    "user": "Container runs as uid/gid 996 (agent). Never root.",
+    "secrets": "ccToken is read from stdin only. Never present in argv, env, or logs.",
+    "egress": "Egress allowlist is enforced by the runner via Fly Machines firewall, not this image.",
+    "fs": "Root filesystem is read-only at runtime (runner sets --read-only). Only /workspace and /tmp are writable."
+  }
+}
