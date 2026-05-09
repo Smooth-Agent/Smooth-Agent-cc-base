@@ -32,11 +32,16 @@ readonly CC_CONFIG_DIR="${HOME}/.claude"
 
 # ---- Helpers --------------------------------------------------------------
 
-# Emit a JSON event line on stdout.
+# Emit a JSON event line on stdout. Use jq to construct the whole object so
+# we never produce malformed JSON regardless of what's in $data.
 emit() {
-  local type="$1"; shift
-  local data="${1:-{}}"
-  printf '{"type":"%s","data":%s,"ts":%s}\n' "$type" "$data" "$(date +%s%3N)"
+  local type="$1"
+  local data="$2"
+  [[ -z "$data" ]] && data='{}'
+  local ts
+  ts=$(date +%s%3N)
+  jq -nc --arg t "$type" --argjson d "$data" --argjson ts "$ts" \
+    '{type:$t, data:$d, ts:$ts}'
 }
 
 # Emit an error event and exit non-zero.
