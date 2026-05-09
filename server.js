@@ -48,6 +48,30 @@ function logError(msg, extra = {}) {
 	process.stderr.write(JSON.stringify({ ts: nowMs(), level: 'error', msg, ...extra }) + '\n');
 }
 
+/**
+ * Remove stale Claude Code session state on the persistent volume.
+ *
+ * /workspace is mounted from a Fly Volume that persists across turns. If a
+ * previous turn's claude process died without releasing its session lockfile
+ * (machine destroyed mid-run, server crash, etc), the next turn would hit
+ * "Session ID X is already in use". We nuke the sessions/ subdir on every
+ * turn — claude rebuilds it on demand, conversation continuity comes from
+ * the system prompt context bridge in core (chats-api.ts).
+ *
+ * We keep /workspace/.claude/CLAUDE.md and other non-session config because
+ * it's customer-authored project rules, not state.
+ */
+function cleanStaleSessionState() {
+	const sessionsDir = '/workspace/.claude/sessions';
+	try {
+		fs.rmSync(sessionsDir, { recursive: true, force: true });
+	} catch (err) {
+		// Best-effort. If we can't, claude may still fail with "in use" — but at
+		// least try.
+		logError('failed to clean .claude/sessions', { msg: err && err.message });
+	}
+}
+
 /** Configure Claude Code OAuth credentials before exec'ing claude. */
 function configureCcAuth(token) {
 	const homeDir = process.env.HOME || '/root';
@@ -150,6 +174,7 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 			configureCcAuth(envelope.ccToken);
+			cleanStaleSessionState();
 			const args = buildClaudeArgs(envelope);
 			await runProc('claude', args, res, emit);
 		} else if (mode === 'build' || mode === 'exec') {
