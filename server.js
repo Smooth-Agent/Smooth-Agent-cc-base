@@ -236,6 +236,12 @@ function configureCcAuth(token) {
 /** Build claude argv from the envelope. */
 function buildClaudeArgs(envelope) {
 	const args = ['--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+	// Sandbox is the trust boundary, not the CLI prompt: container is per-turn
+	// ephemeral, /workspace lives in tmpfs, R2 is scoped to one chat. Without
+	// bypass, claude refuses every Write/Edit/Bash call and just narrates
+	// "I need permission" — useless in headless mode. Override with
+	// --permission-mode default if a customer image needs interactive prompts.
+	args.push('--permission-mode', 'bypassPermissions');
 	if (envelope.model) args.push('--model', envelope.model);
 	if (envelope.sessionId) args.push('--session-id', envelope.sessionId);
 	if (envelope.systemPrompt) args.push('--system-prompt', envelope.systemPrompt);
