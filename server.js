@@ -429,6 +429,12 @@ const server = http.createServer(async (req, res) => {
 		: null;
 
 	try {
+		// Phase timestamps emitted as events for the worker-side benchmark
+		// instrumentation. These are inner-container measurements that the
+		// translator forwards as 'phase' events for telemetry only.
+		const t_run_received = nowMs();
+		emit('phase', { name: 'run_received', ts: t_run_received });
+
 		if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
@@ -451,6 +457,7 @@ const server = http.createServer(async (req, res) => {
 			//    exclusion list), then write fresh creds.
 			wipeClaudeState();
 			configureCcAuth(envelope.ccToken);
+			emit('phase', { name: 'pre_claude_spawn', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 
 			// 3. Run claude. Spawned with default env (process.env) — workspace
 			//    JWT is held in a JS variable scoped to this request handler,
@@ -458,6 +465,7 @@ const server = http.createServer(async (req, res) => {
 			//    this server's JS heap.
 			const args = buildClaudeArgs(envelope);
 			await runProc('claude', args, res, emit);
+			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 
 			// 4. Push workspace back to R2 via Worker so the next turn sees it.
 			//    Best-effort: failures are logged + emitted but never mask
