@@ -36,141 +36,216 @@ const HOST = '0.0.0.0';
 let inFlight = false;
 
 // ---------------------------------------------------------------------------
-// R2 sync state.
+// Workspace proxy sync.
 //
-// Holds rclone env vars for the duration of one /run. Module-scoped so it is
-// reachable by syncFromR2/syncToR2, but DELIBERATELY NOT placed on process.env
-// — claude is spawned with the default env (process.env), so by never setting
-// these globals we guarantee the model can't read R2 credentials via the bash
-// tool. rclone is spawned with `{ env: { ...process.env, ...r2Env } }` only.
+// Container talks to the Worker (`workspaceProxy.url`) using a short-lived
+// JWT (`workspaceProxy.jwt`) — NEVER directly to R2. The Worker enforces
+// that every op is rooted at workspaces/<jwt.chatId>/, so cross-tenant
+// leaks are impossible by construction even if claude is jailbroken and
+// extracts the JWT (it would only get access to its own chat).
+//
+// We use Node 22 built-in fetch — no S3 client, no rclone, no long-lived
+// credentials. The JWT is the ONLY thing in container memory that touches
+// R2, and it's chat-scoped + 10-min expiring.
 // ---------------------------------------------------------------------------
-let r2Env = null;
 
-function setR2Credentials(r2Config) {
-	if (!r2Config) return false;
-	const { accessKey, secretKey, endpoint } = r2Config;
-	if (!accessKey || !secretKey || !endpoint) {
-		logError('r2Config provided but incomplete; skipping sync');
-		return false;
-	}
-	r2Env = {
-		RCLONE_CONFIG_R2_TYPE: 's3',
-		RCLONE_CONFIG_R2_PROVIDER: 'Cloudflare',
-		RCLONE_CONFIG_R2_ACCESS_KEY_ID: accessKey,
-		RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: secretKey,
-		RCLONE_CONFIG_R2_ENDPOINT: endpoint,
-		RCLONE_CONFIG_R2_REGION: 'auto',
-		// Suppress slow checksum operations rclone tries on S3-compat backends
-		// that R2 doesn't fully support; checksum mode is set per-call instead.
-		RCLONE_S3_NO_CHECK_BUCKET: 'true',
-	};
-	return true;
+const SYNC_CONCURRENCY = 8;
+
+// Excluded path patterns. Apply both ways so node_modules / .git / claude
+// internals never traverse R2 even if a stale upload sneaks through.
+function shouldExclude(rel) {
+	if (rel.startsWith('node_modules/') || rel.includes('/node_modules/')) return true;
+	if (rel.startsWith('.claude/') || rel.startsWith('.claude.json')) return true;
+	if (rel.startsWith('.git/') || rel.includes('/.git/')) return true;
+	if (rel.endsWith('.log')) return true;
+	if (rel.startsWith('.cache/') || rel.includes('/.cache/')) return true;
+	return false;
 }
 
-function rcloneSpawnEnv() {
-	return r2Env ? { ...process.env, ...r2Env } : { ...process.env };
+async function proxyFetch(proxy, urlPath, init = {}) {
+	const headers = { ...(init.headers || {}), Authorization: `Bearer ${proxy.jwt}` };
+	return fetch(`${proxy.url}${urlPath}`, { ...init, headers });
+}
+
+async function listWorkspace(proxy) {
+	const res = await proxyFetch(proxy, '/internal/workspace/list');
+	if (!res.ok) {
+		const txt = await res.text().catch(() => '');
+		throw new Error(`list ${res.status}: ${txt.slice(0, 200)}`);
+	}
+	const data = await res.json();
+	return Array.isArray(data?.files) ? data.files : [];
+}
+
+async function getFile(proxy, rel) {
+	const res = await proxyFetch(proxy, `/internal/workspace/get?path=${encodeURIComponent(rel)}`);
+	if (res.status === 404) return null;
+	if (!res.ok) throw new Error(`get ${rel} ${res.status}`);
+	const buf = await res.arrayBuffer();
+	return Buffer.from(buf);
+}
+
+async function putFile(proxy, rel, buffer) {
+	const res = await proxyFetch(proxy, `/internal/workspace/put?path=${encodeURIComponent(rel)}`, {
+		method: 'PUT',
+		headers: {
+			'Content-Type': 'application/octet-stream',
+			'Content-Length': String(buffer.length),
+		},
+		body: buffer,
+	});
+	if (!res.ok) {
+		const txt = await res.text().catch(() => '');
+		throw new Error(`put ${rel} ${res.status}: ${txt.slice(0, 200)}`);
+	}
+}
+
+async function deleteFile(proxy, rel) {
+	const res = await proxyFetch(proxy, `/internal/workspace/delete?path=${encodeURIComponent(rel)}`, {
+		method: 'DELETE',
+	});
+	if (!res.ok && res.status !== 404) {
+		throw new Error(`delete ${rel} ${res.status}`);
+	}
+}
+
+// Walk a local directory into a flat list of relative paths (with excludes).
+async function walkLocal(workspaceDir) {
+	const out = [];
+	async function rec(dir, base) {
+		let entries;
+		try {
+			entries = await fs.promises.readdir(dir, { withFileTypes: true });
+		} catch (err) {
+			if (err && err.code === 'ENOENT') return;
+			throw err;
+		}
+		for (const e of entries) {
+			const full = path.join(dir, e.name);
+			const rel = base ? `${base}/${e.name}` : e.name;
+			if (e.isSymbolicLink()) continue;
+			if (e.isDirectory()) {
+				if (shouldExclude(rel + '/')) continue;
+				await rec(full, rel);
+			} else if (e.isFile()) {
+				if (shouldExclude(rel)) continue;
+				out.push(rel);
+			}
+		}
+	}
+	await rec(workspaceDir, '');
+	return out;
+}
+
+// Bounded-concurrency pool. Returns {results, errors}.
+async function pool(items, fn, concurrency) {
+	const out = new Array(items.length);
+	let next = 0;
+	let errors = 0;
+	async function worker() {
+		while (next < items.length) {
+			const i = next++;
+			try {
+				out[i] = await fn(items[i], i);
+			} catch (err) {
+				errors++;
+				out[i] = { __error: err && err.message ? err.message : String(err) };
+			}
+		}
+	}
+	const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+	await Promise.all(workers);
+	return { results: out, errors };
 }
 
 /**
- * Sync R2 prefix → /workspace (download). Called BEFORE claude spawn so the
- * model sees prior turn's files. Empty prefix on first turn = noop fast path.
- *
- * Excludes node_modules and .claude on the way down — node_modules is bundled
- * into the customer image (Option D from architecture doc), and .claude is
- * always wiped+rewritten by configureCcAuth.
+ * Sync R2 → /workspace via the Worker proxy. Called BEFORE claude spawn.
+ * First turn returns empty manifest from the proxy, so this is near-noop.
  */
-async function syncFromR2(r2Config, workspaceDir) {
-	if (!r2Config) return { skipped: true };
-	const { bucket, prefix } = r2Config;
-	if (!bucket) return { skipped: true, reason: 'no_bucket' };
+async function syncFromWorker(proxy, workspaceDir) {
+	if (!proxy?.url || !proxy?.jwt) return { skipped: true, reason: 'no_proxy' };
 
 	fs.mkdirSync(workspaceDir, { recursive: true });
-
-	const remote = `r2:${bucket}/${prefix || ''}`;
-	const args = [
-		'sync',
-		remote,
-		workspaceDir,
-		'--transfers', '8',
-		'--checkers', '16',
-		'--fast-list',
-		'--exclude', 'node_modules/**',
-		'--exclude', '.claude/**',
-		'--exclude', '.claude.json',
-		'--exclude', '.claude.json.backup',
-		'--exclude', '.git/**',
-		'--exclude', '*.log',
-		'--exclude', '.cache/**',
-		'--quiet',
-	];
 	const t0 = nowMs();
-	const result = await spawnRclone(args);
-	return { ...result, ms: nowMs() - t0, remote };
+
+	let files;
+	try {
+		files = await listWorkspace(proxy);
+	} catch (err) {
+		return { ok: false, ms: nowMs() - t0, error: err.message };
+	}
+	// Defensive client-side excludes too — in case the bucket has historical
+	// junk that pre-dates the current excludes list.
+	files = files.filter((f) => !shouldExclude(f.key));
+
+	if (files.length === 0) {
+		return { ok: true, ms: nowMs() - t0, count: 0 };
+	}
+
+	const { errors } = await pool(
+		files,
+		async (f) => {
+			const buf = await getFile(proxy, f.key);
+			if (!buf) return { skipped: true };
+			const dest = path.join(workspaceDir, f.key);
+			fs.mkdirSync(path.dirname(dest), { recursive: true });
+			await fs.promises.writeFile(dest, buf);
+			return { wrote: f.key, bytes: buf.length };
+		},
+		SYNC_CONCURRENCY,
+	);
+
+	return { ok: errors === 0, ms: nowMs() - t0, count: files.length, errors };
 }
 
 /**
- * Sync /workspace → R2 prefix (upload). Called AFTER claude exits so its
- * generated files are durable across turns.
+ * Sync /workspace → R2 via the Worker proxy. Called AFTER claude exits.
  *
- * Same exclusions as the down direction. Failures here are logged but do
- * not mask claude's own exit code — caller decides whether to bubble up.
+ * Behaves like `rclone sync` (mirror): uploads every local file and deletes
+ * remote files that no longer exist locally. Failures are logged but never
+ * mask claude's own exit/result event.
  */
-async function syncToR2(r2Config, workspaceDir) {
-	if (!r2Config) return { skipped: true };
-	const { bucket, prefix } = r2Config;
-	if (!bucket) return { skipped: true, reason: 'no_bucket' };
+async function syncToWorker(proxy, workspaceDir) {
+	if (!proxy?.url || !proxy?.jwt) return { skipped: true, reason: 'no_proxy' };
 	if (!fs.existsSync(workspaceDir)) return { skipped: true, reason: 'no_workspace_dir' };
 
-	const remote = `r2:${bucket}/${prefix || ''}`;
-	const args = [
-		'sync',
-		workspaceDir,
-		remote,
-		'--transfers', '8',
-		'--checkers', '16',
-		'--fast-list',
-		'--exclude', 'node_modules/**',
-		'--exclude', '.claude/**',
-		'--exclude', '.claude.json',
-		'--exclude', '.claude.json.backup',
-		'--exclude', '.git/**',
-		'--exclude', '*.log',
-		'--exclude', '.cache/**',
-		'--quiet',
-	];
 	const t0 = nowMs();
-	const result = await spawnRclone(args);
-	return { ...result, ms: nowMs() - t0, remote };
-}
 
-function spawnRclone(args) {
-	return new Promise((resolve) => {
-		const proc = spawn('/usr/local/bin/rclone', args, {
-			stdio: ['ignore', 'pipe', 'pipe'],
-			env: rcloneSpawnEnv(),
-		});
-		const stderrBuf = [];
-		proc.stderr.on('data', (c) => {
-			stderrBuf.push(c);
-			let total = 0;
-			for (const b of stderrBuf) total += b.length;
-			while (total > 8192 && stderrBuf.length > 1) {
-				const removed = stderrBuf.shift();
-				total -= removed.length;
-			}
-		});
-		proc.on('error', (err) => {
-			resolve({ ok: false, code: -1, err: err.message });
-		});
-		proc.on('exit', (code) => {
-			if (code === 0) {
-				resolve({ ok: true, code: 0 });
-			} else {
-				const stderrTail = Buffer.concat(stderrBuf).toString('utf8').slice(-512);
-				resolve({ ok: false, code, stderrTail });
-			}
-		});
-	});
+	const [localList, remoteList] = await Promise.all([
+		walkLocal(workspaceDir),
+		listWorkspace(proxy).catch(() => []),
+	]);
+	const localSet = new Set(localList);
+	const remoteRels = remoteList.map((f) => f.key).filter((k) => !shouldExclude(k));
+
+	const upload = await pool(
+		localList,
+		async (rel) => {
+			const full = path.join(workspaceDir, rel);
+			const buf = await fs.promises.readFile(full);
+			await putFile(proxy, rel, buf);
+			return { rel, bytes: buf.length };
+		},
+		SYNC_CONCURRENCY,
+	);
+
+	const toDelete = remoteRels.filter((rel) => !localSet.has(rel));
+	let deleteErrors = 0;
+	if (toDelete.length) {
+		const del = await pool(toDelete, async (rel) => {
+			await deleteFile(proxy, rel);
+			return { rel };
+		}, SYNC_CONCURRENCY);
+		deleteErrors = del.errors;
+	}
+
+	return {
+		ok: upload.errors === 0 && deleteErrors === 0,
+		ms: nowMs() - t0,
+		uploaded: localList.length,
+		deleted: toDelete.length,
+		errors: upload.errors + deleteErrors,
+	};
 }
 
 function nowMs() {
@@ -324,52 +399,62 @@ const server = http.createServer(async (req, res) => {
 
 	// Dispatch.
 	const workspaceDir = process.env.RUN_CWD || '/workspace';
-	// Configure R2 ONCE, before sync. setR2Credentials is the only call that
-	// stores the creds in module scope; nothing else reads them and they are
-	// never copied to process.env, so claude's spawned child can't see them.
-	const haveR2 = setR2Credentials(envelope.r2Config);
+	// Workspace proxy: container talks to the Worker (not R2). Worker scopes
+	// every op to this chat's prefix using the chatId baked into the JWT,
+	// so even if the JWT is exfiltrated by a jailbroken claude it can only
+	// access this chat's files. No S3 token exists in this process.
+	const proxy = envelope.workspaceProxy && envelope.workspaceProxy.url && envelope.workspaceProxy.jwt
+		? envelope.workspaceProxy
+		: null;
 
 	try {
 		if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 
-			// 1. Pull last-turn workspace from R2 (noop if first turn / no creds).
-			if (haveR2) {
-				emit('sync_down_start', { remote: `r2:${envelope.r2Config.bucket}/${envelope.r2Config.prefix || ''}` });
-				const downResult = await syncFromR2(envelope.r2Config, workspaceDir);
+			// 1. Pull last-turn workspace from R2 via Worker (noop on first turn).
+			if (proxy) {
+				emit('sync_down_start', {});
+				const downResult = await syncFromWorker(proxy, workspaceDir);
 				if (downResult.ok === false) {
-					logError('sync_down failed', { code: downResult.code, stderr: downResult.stderrTail });
-					emit('sync_down_done', { ok: false, code: downResult.code, ms: downResult.ms });
+					logError('sync_down failed', { error: downResult.error, errors: downResult.errors });
+					emit('sync_down_done', { ok: false, ms: downResult.ms, error: downResult.error });
 					// Don't fail the turn — claude can still run with empty workspace.
 				} else {
-					emit('sync_down_done', { ok: true, ms: downResult.ms });
+					emit('sync_down_done', { ok: true, ms: downResult.ms, count: downResult.count });
 				}
 			}
 
 			// 2. Wipe and write fresh CC credentials. Order matters: wipe FIRST
-			//    (kills stale state from R2 sync if any sneaked through .claude
-			//    exclusion), then write fresh creds.
+			//    (kills stale state from R2 sync if any sneaked through the
+			//    exclusion list), then write fresh creds.
 			wipeClaudeState();
 			configureCcAuth(envelope.ccToken);
 
-			// 3. Run claude. Spawned with default env (process.env) — R2 creds
-			//    are NOT in there, so the model can't exfiltrate them via bash.
+			// 3. Run claude. Spawned with default env (process.env) — workspace
+			//    JWT is held in a JS variable scoped to this request handler,
+			//    not in the env. claude can read its OWN env via bash, but not
+			//    this server's JS heap.
 			const args = buildClaudeArgs(envelope);
 			await runProc('claude', args, res, emit);
 
-			// 4. Push workspace back to R2 so next turn sees it. Best-effort:
-			//    failures here are logged + emitted but don't reverse claude's
-			//    output. If the user's connection already closed, emit() noops.
-			if (haveR2) {
+			// 4. Push workspace back to R2 via Worker so the next turn sees it.
+			//    Best-effort: failures are logged + emitted but never mask
+			//    claude's own output.
+			if (proxy) {
 				emit('sync_up_start', {});
 				try {
-					const upResult = await syncToR2(envelope.r2Config, workspaceDir);
+					const upResult = await syncToWorker(proxy, workspaceDir);
 					if (upResult.ok === false) {
-						logError('sync_up failed', { code: upResult.code, stderr: upResult.stderrTail });
-						emit('sync_up_done', { ok: false, code: upResult.code, ms: upResult.ms });
+						logError('sync_up failed', { errors: upResult.errors });
+						emit('sync_up_done', { ok: false, ms: upResult.ms, errors: upResult.errors });
 					} else {
-						emit('sync_up_done', { ok: true, ms: upResult.ms });
+						emit('sync_up_done', {
+							ok: true,
+							ms: upResult.ms,
+							uploaded: upResult.uploaded,
+							deleted: upResult.deleted,
+						});
 					}
 				} catch (err) {
 					logError('sync_up threw', { msg: err && err.message });
