@@ -53,12 +53,33 @@ const SYNC_CONCURRENCY = 8;
 
 // Excluded path patterns. Apply both ways so node_modules / .git / claude
 // internals never traverse R2 even if a stale upload sneaks through.
+//
+// HOME dotfiles (.bashrc, .profile, etc) appear at the workspace root because
+// HOME=/workspace for the agent user. They're useradd defaults — not user
+// content — so they should never appear in R2. .npmrc / .ssh / .gnupg get
+// special exclusion because they may contain credentials.
+const HOME_DOTFILES = new Set([
+	'.bashrc',
+	'.bash_logout',
+	'.bash_history',
+	'.bash_profile',
+	'.profile',
+	'.npmrc',
+	'.viminfo',
+	'.lesshst',
+	'.wget-hsts',
+]);
+
 function shouldExclude(rel) {
 	if (rel.startsWith('node_modules/') || rel.includes('/node_modules/')) return true;
 	if (rel.startsWith('.claude/') || rel.startsWith('.claude.json')) return true;
 	if (rel.startsWith('.git/') || rel.includes('/.git/')) return true;
+	if (rel.startsWith('.ssh/') || rel.startsWith('.gnupg/')) return true;
 	if (rel.endsWith('.log')) return true;
 	if (rel.startsWith('.cache/') || rel.includes('/.cache/')) return true;
+	// HOME dotfiles only at the workspace ROOT (no slash before name).
+	// Subpaths like myproject/.bashrc are user content and should sync.
+	if (!rel.includes('/') && HOME_DOTFILES.has(rel)) return true;
 	return false;
 }
 
