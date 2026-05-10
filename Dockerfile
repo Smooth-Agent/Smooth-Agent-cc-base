@@ -16,11 +16,12 @@ RUN groupadd --system --gid 996 agent \
  && useradd  --system --uid 996 --gid agent \
              --home-dir /workspace --shell /bin/bash --create-home agent
 
-# Minimal packages: ca-certs for HTTPS, curl for healthchecks, jq for stdin parsing,
-# tini as init for proper signal handling on container teardown.
+# Minimal packages: ca-certs for HTTPS, curl for healthchecks + rclone install,
+# jq for stdin parsing, unzip for rclone release zip, tini as init for proper
+# signal handling on container teardown.
 RUN apt-get update \
  && apt-get install --yes --no-install-recommends \
-    ca-certificates curl jq tini git \
+    ca-certificates curl jq unzip tini git \
  && rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI (official npm package).
@@ -28,6 +29,22 @@ RUN apt-get update \
 ARG CC_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VERSION}" \
  && npm cache clean --force
+
+# rclone — used by server.js to sync /workspace to/from Cloudflare R2 each turn.
+# We replace the previous Fly Volume model: the volume was per-project persistent
+# state (~30 MB per chat), now /workspace lives in tmpfs and is synced to R2 at
+# turn boundaries. R2 storage is ~10× cheaper than Fly Volumes and we don't pay
+# for idle space.
+#
+# Multi-arch: dpkg --print-architecture returns 'amd64' or 'arm64'; rclone
+# releases publish both. Pinned version for reproducibility.
+ARG RCLONE_VERSION=v1.69.0
+RUN ARCH=$(dpkg --print-architecture) \
+ && curl -fsSL "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-${ARCH}.zip" -o /tmp/rclone.zip \
+ && unzip -q /tmp/rclone.zip -d /tmp \
+ && mv "/tmp/rclone-${RCLONE_VERSION}-linux-${ARCH}/rclone" /usr/local/bin/rclone \
+ && chmod 0755 /usr/local/bin/rclone \
+ && rm -rf /tmp/rclone*
 
 # Entrypoint script (legacy stdin-pipe path) + HTTP server (preferred path).
 COPY --chown=root:root --chmod=0755 entrypoint.sh /opt/smoothagent/entrypoint.sh

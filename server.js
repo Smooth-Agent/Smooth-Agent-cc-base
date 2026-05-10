@@ -35,6 +35,140 @@ const HOST = '0.0.0.0';
 
 let inFlight = false;
 
+// ---------------------------------------------------------------------------
+// R2 sync state.
+//
+// Holds rclone env vars for the duration of one /run. Module-scoped so it is
+// reachable by syncFromR2/syncToR2, but DELIBERATELY NOT placed on process.env
+// — claude is spawned with the default env (process.env), so by never setting
+// these globals we guarantee the model can't read R2 credentials via the bash
+// tool. rclone is spawned with `{ env: { ...process.env, ...r2Env } }` only.
+// ---------------------------------------------------------------------------
+let r2Env = null;
+
+function setR2Credentials(r2Config) {
+	if (!r2Config) return false;
+	const { accessKey, secretKey, endpoint } = r2Config;
+	if (!accessKey || !secretKey || !endpoint) {
+		logError('r2Config provided but incomplete; skipping sync');
+		return false;
+	}
+	r2Env = {
+		RCLONE_CONFIG_R2_TYPE: 's3',
+		RCLONE_CONFIG_R2_PROVIDER: 'Cloudflare',
+		RCLONE_CONFIG_R2_ACCESS_KEY_ID: accessKey,
+		RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: secretKey,
+		RCLONE_CONFIG_R2_ENDPOINT: endpoint,
+		RCLONE_CONFIG_R2_REGION: 'auto',
+		// Suppress slow checksum operations rclone tries on S3-compat backends
+		// that R2 doesn't fully support; checksum mode is set per-call instead.
+		RCLONE_S3_NO_CHECK_BUCKET: 'true',
+	};
+	return true;
+}
+
+function rcloneSpawnEnv() {
+	return r2Env ? { ...process.env, ...r2Env } : { ...process.env };
+}
+
+/**
+ * Sync R2 prefix → /workspace (download). Called BEFORE claude spawn so the
+ * model sees prior turn's files. Empty prefix on first turn = noop fast path.
+ *
+ * Excludes node_modules and .claude on the way down — node_modules is bundled
+ * into the customer image (Option D from architecture doc), and .claude is
+ * always wiped+rewritten by configureCcAuth.
+ */
+async function syncFromR2(r2Config, workspaceDir) {
+	if (!r2Config) return { skipped: true };
+	const { bucket, prefix } = r2Config;
+	if (!bucket) return { skipped: true, reason: 'no_bucket' };
+
+	fs.mkdirSync(workspaceDir, { recursive: true });
+
+	const remote = `r2:${bucket}/${prefix || ''}`;
+	const args = [
+		'sync',
+		remote,
+		workspaceDir,
+		'--transfers', '8',
+		'--checkers', '16',
+		'--fast-list',
+		'--exclude', 'node_modules/**',
+		'--exclude', '.claude/**',
+		'--exclude', '.git/**',
+		'--exclude', '*.log',
+		'--exclude', '.cache/**',
+		'--quiet',
+	];
+	const t0 = nowMs();
+	const result = await spawnRclone(args);
+	return { ...result, ms: nowMs() - t0, remote };
+}
+
+/**
+ * Sync /workspace → R2 prefix (upload). Called AFTER claude exits so its
+ * generated files are durable across turns.
+ *
+ * Same exclusions as the down direction. Failures here are logged but do
+ * not mask claude's own exit code — caller decides whether to bubble up.
+ */
+async function syncToR2(r2Config, workspaceDir) {
+	if (!r2Config) return { skipped: true };
+	const { bucket, prefix } = r2Config;
+	if (!bucket) return { skipped: true, reason: 'no_bucket' };
+	if (!fs.existsSync(workspaceDir)) return { skipped: true, reason: 'no_workspace_dir' };
+
+	const remote = `r2:${bucket}/${prefix || ''}`;
+	const args = [
+		'sync',
+		workspaceDir,
+		remote,
+		'--transfers', '8',
+		'--checkers', '16',
+		'--fast-list',
+		'--exclude', 'node_modules/**',
+		'--exclude', '.claude/**',
+		'--exclude', '.git/**',
+		'--exclude', '*.log',
+		'--exclude', '.cache/**',
+		'--quiet',
+	];
+	const t0 = nowMs();
+	const result = await spawnRclone(args);
+	return { ...result, ms: nowMs() - t0, remote };
+}
+
+function spawnRclone(args) {
+	return new Promise((resolve) => {
+		const proc = spawn('/usr/local/bin/rclone', args, {
+			stdio: ['ignore', 'pipe', 'pipe'],
+			env: rcloneSpawnEnv(),
+		});
+		const stderrBuf = [];
+		proc.stderr.on('data', (c) => {
+			stderrBuf.push(c);
+			let total = 0;
+			for (const b of stderrBuf) total += b.length;
+			while (total > 8192 && stderrBuf.length > 1) {
+				const removed = stderrBuf.shift();
+				total -= removed.length;
+			}
+		});
+		proc.on('error', (err) => {
+			resolve({ ok: false, code: -1, err: err.message });
+		});
+		proc.on('exit', (code) => {
+			if (code === 0) {
+				resolve({ ok: true, code: 0 });
+			} else {
+				const stderrTail = Buffer.concat(stderrBuf).toString('utf8').slice(-512);
+				resolve({ ok: false, code, stderrTail });
+			}
+		});
+	});
+}
+
 function nowMs() {
 	return Date.now();
 }
@@ -179,15 +313,59 @@ const server = http.createServer(async (req, res) => {
 	emit('ready', { mode, cwd: process.cwd() });
 
 	// Dispatch.
+	const workspaceDir = process.env.RUN_CWD || '/workspace';
+	// Configure R2 ONCE, before sync. setR2Credentials is the only call that
+	// stores the creds in module scope; nothing else reads them and they are
+	// never copied to process.env, so claude's spawned child can't see them.
+	const haveR2 = setR2Credentials(envelope.r2Config);
+
 	try {
 		if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
-			// Order matters: wipe FIRST (kills stale state), then write fresh creds.
+
+			// 1. Pull last-turn workspace from R2 (noop if first turn / no creds).
+			if (haveR2) {
+				emit('sync_down_start', { remote: `r2:${envelope.r2Config.bucket}/${envelope.r2Config.prefix || ''}` });
+				const downResult = await syncFromR2(envelope.r2Config, workspaceDir);
+				if (downResult.ok === false) {
+					logError('sync_down failed', { code: downResult.code, stderr: downResult.stderrTail });
+					emit('sync_down_done', { ok: false, code: downResult.code, ms: downResult.ms });
+					// Don't fail the turn — claude can still run with empty workspace.
+				} else {
+					emit('sync_down_done', { ok: true, ms: downResult.ms });
+				}
+			}
+
+			// 2. Wipe and write fresh CC credentials. Order matters: wipe FIRST
+			//    (kills stale state from R2 sync if any sneaked through .claude
+			//    exclusion), then write fresh creds.
 			wipeClaudeState();
 			configureCcAuth(envelope.ccToken);
+
+			// 3. Run claude. Spawned with default env (process.env) — R2 creds
+			//    are NOT in there, so the model can't exfiltrate them via bash.
 			const args = buildClaudeArgs(envelope);
 			await runProc('claude', args, res, emit);
+
+			// 4. Push workspace back to R2 so next turn sees it. Best-effort:
+			//    failures here are logged + emitted but don't reverse claude's
+			//    output. If the user's connection already closed, emit() noops.
+			if (haveR2) {
+				emit('sync_up_start', {});
+				try {
+					const upResult = await syncToR2(envelope.r2Config, workspaceDir);
+					if (upResult.ok === false) {
+						logError('sync_up failed', { code: upResult.code, stderr: upResult.stderrTail });
+						emit('sync_up_done', { ok: false, code: upResult.code, ms: upResult.ms });
+					} else {
+						emit('sync_up_done', { ok: true, ms: upResult.ms });
+					}
+				} catch (err) {
+					logError('sync_up threw', { msg: err && err.message });
+					emit('sync_up_done', { ok: false, error: 'exception' });
+				}
+			}
 		} else if (mode === 'build' || mode === 'exec') {
 			if (!Array.isArray(envelope.cmd) || envelope.cmd.length === 0) {
 				throw new Error(`cmd required for mode=${mode}`);
