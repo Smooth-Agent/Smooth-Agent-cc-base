@@ -297,22 +297,33 @@ function logError(msg, extra = {}) {
  */
 function wipeClaudeState() {
 	// HOME for the `agent` user is /workspace (Dockerfile useradd --home-dir),
-	// so ~/.claude resolves into the persistent Fly Volume. Claude stores
-	// per-project session state under .claude/projects/<hash>/sessions/<id>.jsonl.
-	// If a prior turn died mid-run, the lockfile/state survives and the next
-	// turn errors with "Session ID X is already in use". Wipe the whole
-	// .claude dir before each turn — auth credentials are re-written by
-	// configureCcAuth right after.
+	// so ~/.claude resolves into the persistent Fly Volume / tmpfs.
 	//
-	// Note: project files in /workspace/* (NOT under .claude/) are untouched;
-	// CLAUDE.md and similar live at the project root, not under .claude/, so
-	// they survive.
+	// PREVIOUSLY: this wiped the entire .claude dir. That fixed "Session ID X
+	// is already in use" but ALSO blew away anything Claude caches between
+	// runs (MCP server caches, OAuth session caches inside Anthropic SDK,
+	// model/tokenizer caches), forcing a full cold OAuth handshake every turn.
+	//
+	// NOW: we wipe ONLY the session lockfiles. caches and credentials survive.
+	// configureCcAuth still overwrites .credentials.json right after, so any
+	// stale OAuth token gets replaced — but the SDK-level session cache is
+	// preserved, which lets the second turn skip part of the Anthropic
+	// handshake.
 	const homeDir = process.env.HOME || '/workspace';
-	const ccDir = path.join(homeDir, '.claude');
+	const projectsDir = path.join(homeDir, '.claude', 'projects');
 	try {
-		fs.rmSync(ccDir, { recursive: true, force: true });
+		if (!fs.existsSync(projectsDir)) return;
+		// Walk projects/* and remove only sessions/ subdirs. Keeps project
+		// indices, MCP caches, agent settings.
+		for (const proj of fs.readdirSync(projectsDir)) {
+			const sessionsDir = path.join(projectsDir, proj, 'sessions');
+			if (fs.existsSync(sessionsDir)) {
+				try { fs.rmSync(sessionsDir, { recursive: true, force: true }); }
+				catch (e) { logError('failed to wipe sessions dir', { proj, msg: e && e.message }); }
+			}
+		}
 	} catch (err) {
-		logError('failed to wipe .claude state', { msg: err && err.message });
+		logError('failed to wipe .claude sessions', { msg: err && err.message });
 	}
 }
 
@@ -518,15 +529,66 @@ const server = http.createServer(async (req, res) => {
 /** Spawn a process, pipe stdout chunks raw to the response (claude case). */
 function runProc(command, args, res, emit) {
 	return new Promise((resolve) => {
+		const t_spawn_called = nowMs();
+
 		const proc = spawn(command, args, {
 			cwd: process.env.RUN_CWD || '/workspace',
 			env: process.env,
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});
 
+		// Phase markers — emit BEFORE forwarding chunks so the worker translator
+		// captures them in order. These let us see what's slow INSIDE claude:
+		//   claude_spawned        — spawn() returned (proc has pid)
+		//   claude_first_stdout   — Node/CLI booted, first byte written
+		//   claude_first_system   — first stream-json system event (CLI initialized,
+		//                           MCP loaded, ready for inference)
+		//   claude_first_assistant — first text/thinking event from Anthropic
+		//                            (this is the REAL "Claude responded" moment)
+		const t_spawn_returned = nowMs();
+		emit('phase', { name: 'claude_spawned', ts: t_spawn_returned, since_spawn_call_ms: t_spawn_returned - t_spawn_called });
+
+		let firstStdoutSeen = false;
+		let firstSystemSeen = false;
+		let firstAssistantSeen = false;
+		let lineBuffer = '';
+
+		function inspectLine(line) {
+			if (!line) return;
+			let obj;
+			try { obj = JSON.parse(line); } catch { return; }
+			if (!obj || typeof obj !== 'object') return;
+			const type = obj.type;
+			if (!firstSystemSeen && type === 'system') {
+				firstSystemSeen = true;
+				const t = nowMs();
+				emit('phase', { name: 'claude_first_system', ts: t, since_spawn_call_ms: t - t_spawn_called });
+			}
+			if (!firstAssistantSeen && (type === 'assistant' || type === 'text' || type === 'content_block_start')) {
+				firstAssistantSeen = true;
+				const t = nowMs();
+				emit('phase', { name: 'claude_first_assistant', ts: t, since_spawn_call_ms: t - t_spawn_called });
+			}
+		}
+
 		// claude already emits stream-json (ndjson). Forward raw — saves CPU + preserves
 		// the chatagentico-style frame structure that the runner translator expects.
 		proc.stdout.on('data', (chunk) => {
+			if (!firstStdoutSeen) {
+				firstStdoutSeen = true;
+				const t = nowMs();
+				emit('phase', { name: 'claude_first_stdout', ts: t, since_spawn_call_ms: t - t_spawn_called });
+			}
+			// Buffer & inspect line-by-line (best-effort — we still forward raw bytes).
+			try {
+				lineBuffer += chunk.toString('utf8');
+				let nl;
+				while ((nl = lineBuffer.indexOf('\n')) >= 0) {
+					const line = lineBuffer.slice(0, nl).trim();
+					lineBuffer = lineBuffer.slice(nl + 1);
+					inspectLine(line);
+				}
+			} catch { /* parse errors never block streaming */ }
 			try {
 				res.write(chunk);
 			} catch { /* ignore */ }
