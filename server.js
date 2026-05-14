@@ -36,6 +36,36 @@ const HOST = '0.0.0.0';
 let inFlight = false;
 
 // ---------------------------------------------------------------------------
+// PERSISTENT CLAUDE PROCESS — the heart of the long-running optimization.
+//
+// First /run: spawn claude with --input-format stream-json. Boots Node,
+// loads @anthropic-ai/claude-code, does OAuth handshake with Anthropic.
+// ~20-25s cold cost paid ONCE per machine lifetime.
+//
+// Subsequent /run on the SAME machine (same containerKey → pool reuse):
+// just write a new user message to claude's stdin. No spawn, no Node load,
+// no OAuth handshake. ~2-3s warm cost.
+//
+// When the args that materially affect Claude's behavior change between
+// turns (model swap, system-prompt change, MCP config change, OR token
+// rotation), the prior process is killed and a new one spawned. Cold cost
+// again on that turn, but rare.
+// ---------------------------------------------------------------------------
+
+/** Currently-running claude process. Null when no claude has been spawned (or it crashed/was killed). */
+let claudeProc = null;
+/** Hash of model+systemPrompt+maxTurns+mcpConfig the running claude was started with. */
+let claudeSig = null;
+/** Last ccToken written to .credentials.json. If a new turn brings a different token, respawn. */
+let claudeTokenHash = null;
+/** Per-turn handler binding — null when no /run is in flight. */
+let activeTurn = null;
+/** Rolling stdout buffer so we can split partial NDJSON lines across data chunks. */
+let stdoutLineBuffer = '';
+/** Time of last /run completion (for the idle-exit watchdog). */
+let lastRunAt = Date.now();
+
+// ---------------------------------------------------------------------------
 // Workspace proxy sync.
 //
 // Container talks to the Worker (`workspaceProxy.url`) using a short-lived
@@ -344,17 +374,28 @@ function configureCcAuth(token) {
 	);
 }
 
-/** Build claude argv from the envelope. */
+/**
+ * Build claude argv for LONG-RUNNING mode (stream-json on stdin).
+ *
+ * Critical differences from one-shot mode:
+ *   - --input-format stream-json: accept user messages on stdin as NDJSON.
+ *     This is the ONLY way to feed a single claude process multiple prompts
+ *     without re-paying the 20s OAuth handshake on every turn.
+ *   - NO prompt in argv (it comes via stdin).
+ *   - NO --session-id: stream-json mode manages the session lifecycle within
+ *     a single process; passing a stale id makes claude refuse with
+ *     "Session already in use".
+ *   - --max-turns kept (it's an upper bound per user turn, not per session).
+ */
 function buildClaudeArgs(envelope) {
-	const args = ['--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
-	// Sandbox is the trust boundary, not the CLI prompt: container is per-turn
-	// ephemeral, /workspace lives in tmpfs, R2 is scoped to one chat. Without
-	// bypass, claude refuses every Write/Edit/Bash call and just narrates
-	// "I need permission" — useless in headless mode. Override with
-	// --permission-mode default if a customer image needs interactive prompts.
-	args.push('--permission-mode', 'bypassPermissions');
+	const args = [
+		'--output-format', 'stream-json',
+		'--input-format', 'stream-json',
+		'--verbose',
+		'--include-partial-messages',
+		'--permission-mode', 'bypassPermissions',
+	];
 	if (envelope.model) args.push('--model', envelope.model);
-	if (envelope.sessionId) args.push('--session-id', envelope.sessionId);
 	if (envelope.systemPrompt) args.push('--system-prompt', envelope.systemPrompt);
 	if (envelope.maxTurns) args.push('--max-turns', String(envelope.maxTurns));
 	if (envelope.mcpConfig) {
@@ -362,8 +403,233 @@ function buildClaudeArgs(envelope) {
 		fs.writeFileSync(tmpFile, JSON.stringify(envelope.mcpConfig));
 		args.push('--mcp-config', tmpFile);
 	}
-	args.push(envelope.prompt);
 	return args;
+}
+
+/**
+ * Signature of the args that materially change Claude's behavior. If a
+ * subsequent /run has a different signature, the persistent process must be
+ * restarted (it's already locked into the prior model/system-prompt/MCPs).
+ */
+function sessionSignature(envelope) {
+	return JSON.stringify({
+		model: envelope.model || null,
+		systemPrompt: envelope.systemPrompt || null,
+		maxTurns: envelope.maxTurns || null,
+		mcpConfig: envelope.mcpConfig || null,
+	});
+}
+
+/**
+ * Cheap fingerprint of the ccToken — we never store the token raw in any
+ * variable that could end up in stderr/error chains; just a short hash so
+ * we can detect rotation between turns.
+ */
+function tokenHash(token) {
+	if (!token) return null;
+	let h = 0x811c9dc5;
+	for (let i = 0; i < token.length; i++) {
+		h ^= token.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(16);
+}
+
+/** Send SIGTERM to the running claude and wait for it to exit. */
+async function killClaude(reason) {
+	if (!claudeProc) return;
+	logInfo('killing persistent claude', { reason, pid: claudeProc.pid });
+	const proc = claudeProc;
+	claudeProc = null;
+	claudeSig = null;
+	claudeTokenHash = null;
+	stdoutLineBuffer = '';
+	try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+	await new Promise((resolve) => {
+		const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} resolve(); }, 3000);
+		proc.once('exit', () => { clearTimeout(timer); resolve(); });
+	});
+}
+
+/**
+ * Spawn the persistent claude process. Caller must have already wiped and
+ * written /workspace/.claude/.credentials.json with the user's OAuth token.
+ *
+ * Returns the proc handle; also wires stdout to the streaming pipeline.
+ */
+function spawnPersistentClaude(envelope) {
+	const args = buildClaudeArgs(envelope);
+	const proc = spawn('claude', args, {
+		cwd: process.env.RUN_CWD || '/workspace',
+		env: process.env,
+		stdio: ['pipe', 'pipe', 'pipe'],
+	});
+	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length });
+
+	proc.stdout.on('data', handleClaudeStdout);
+
+	const stderrTail = [];
+	proc.stderr.on('data', (chunk) => {
+		// Cap to last 64KB so we can surface useful context on crash without
+		// growing unbounded.
+		stderrTail.push(chunk);
+		let total = 0;
+		for (const b of stderrTail) total += b.length;
+		while (total > 65536 && stderrTail.length > 1) {
+			const removed = stderrTail.shift();
+			total -= removed.length;
+		}
+	});
+
+	proc.on('exit', (code) => {
+		const tail = Buffer.concat(stderrTail).toString('utf8').slice(-1024);
+		logError('persistent claude exited', { code, stderrTail: tail.replace(/\n/g, ' | ') });
+		// If a turn was waiting on this process, surface the failure.
+		if (activeTurn) {
+			try {
+				activeTurn.emit('error', {
+					code: 'exit_nonzero',
+					message: `claude exited ${code}${tail ? `\nstderr (tail): ${tail.slice(-512)}` : ''}`,
+					retryable: false,
+				});
+				activeTurn.resolve();
+			} catch {}
+			activeTurn = null;
+		}
+		// Clear top-level state — next /run will respawn fresh.
+		if (claudeProc === proc) {
+			claudeProc = null;
+			claudeSig = null;
+			claudeTokenHash = null;
+			stdoutLineBuffer = '';
+		}
+	});
+
+	claudeProc = proc;
+	claudeSig = sessionSignature(envelope);
+	claudeTokenHash = tokenHash(envelope.ccToken);
+	return proc;
+}
+
+/**
+ * Handle a chunk of stdout from the persistent claude. Forwards raw bytes to
+ * the active /run response AND parses NDJSON line-by-line to detect:
+ *   - first stdout (CLI booted)
+ *   - first 'system' event (CLI ready for inference)
+ *   - first 'assistant' event (model emitting output)
+ *   - 'result' event (current turn finished — release the request)
+ *
+ * Phase markers are emitted as 'phase' events so the worker telemetry can
+ * record them in /timing/cc.
+ */
+function handleClaudeStdout(chunk) {
+	if (!activeTurn) return;
+	const t = activeTurn;
+
+	// Phase: first stdout in this turn
+	if (!t.firstStdoutSeen) {
+		t.firstStdoutSeen = true;
+		t.emit('phase', { name: 'claude_first_stdout', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
+	}
+
+	// Forward raw chunk to caller (preserves frame alignment for translator).
+	try { t.res.write(chunk); } catch { /* connection closed */ }
+
+	// Parse line-by-line for terminal/phase detection.
+	stdoutLineBuffer += chunk.toString('utf8');
+	let nl;
+	while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
+		const line = stdoutLineBuffer.slice(0, nl).trim();
+		stdoutLineBuffer = stdoutLineBuffer.slice(nl + 1);
+		if (!line) continue;
+		let obj;
+		try { obj = JSON.parse(line); } catch { continue; }
+		if (!obj || typeof obj !== 'object') continue;
+		const type = obj.type;
+
+		if (!t.firstSystemSeen && type === 'system') {
+			t.firstSystemSeen = true;
+			t.emit('phase', { name: 'claude_first_system', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
+		}
+		if (!t.firstAssistantSeen && (type === 'assistant' || type === 'text' || type === 'content_block_start')) {
+			t.firstAssistantSeen = true;
+			t.emit('phase', { name: 'claude_first_assistant', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
+		}
+		if (type === 'result') {
+			// Turn finished — release the caller.
+			const turn = activeTurn;
+			activeTurn = null;
+			turn.resolve();
+		}
+	}
+}
+
+/**
+ * Drive one /run against the persistent claude process.
+ *
+ * Spawns claude if it's not running OR if the session args / token have
+ * changed since last turn. Otherwise reuses the existing process — that's
+ * where the time savings come from.
+ */
+async function runPersistentClaude(envelope, res, emit) {
+	const newSig = sessionSignature(envelope);
+	const newTokenHash = tokenHash(envelope.ccToken);
+
+	// Decide: reuse, or kill+respawn?
+	const needsRespawn =
+		!claudeProc ||
+		claudeProc.exitCode !== null ||
+		claudeSig !== newSig ||
+		claudeTokenHash !== newTokenHash;
+
+	if (needsRespawn) {
+		if (claudeProc) {
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: claudeSig !== newSig ? 'args_changed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead') });
+			await killClaude('respawn');
+		}
+		// Refresh credentials.json on disk and (only on first ever turn) wipe
+		// stale session lockfiles. Token may have rotated even when session
+		// args are the same, so always rewrite credentials before spawn.
+		wipeClaudeState();
+		configureCcAuth(envelope.ccToken);
+		const t_spawn_called = nowMs();
+		emit('phase', { name: 'pre_claude_spawn', ts: t_spawn_called });
+		spawnPersistentClaude(envelope);
+		emit('phase', { name: 'claude_spawned', ts: nowMs(), since_spawn_call_ms: nowMs() - t_spawn_called });
+		activeTurn = {
+			res, emit, t_spawn: t_spawn_called,
+			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
+			resolve: null,
+		};
+	} else {
+		// Warm path — reuse existing process. No spawn cost.
+		emit('phase', { name: 'claude_reused', ts: nowMs() });
+		activeTurn = {
+			res, emit, t_spawn: nowMs(),
+			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
+			resolve: null,
+		};
+	}
+
+	// Send the user message via stdin as an NDJSON event. stream-json input
+	// format expects {"type":"user","message":{"role":"user","content":"..."}}.
+	const userEvent = {
+		type: 'user',
+		message: { role: 'user', content: envelope.prompt },
+	};
+	try {
+		claudeProc.stdin.write(JSON.stringify(userEvent) + '\n');
+	} catch (err) {
+		emit('error', { code: 'internal', message: `stdin write failed: ${err && err.message}`, retryable: true });
+		activeTurn = null;
+		return;
+	}
+
+	// Wait for the 'result' event (set by handleClaudeStdout) or process exit.
+	await new Promise((resolve) => {
+		if (activeTurn) activeTurn.resolve = resolve;
+		else resolve(); // already settled by an exit
+	});
 }
 
 const server = http.createServer(async (req, res) => {
@@ -463,19 +729,12 @@ const server = http.createServer(async (req, res) => {
 				}
 			}
 
-			// 2. Wipe and write fresh CC credentials. Order matters: wipe FIRST
-			//    (kills stale state from R2 sync if any sneaked through the
-			//    exclusion list), then write fresh creds.
-			wipeClaudeState();
-			configureCcAuth(envelope.ccToken);
-			emit('phase', { name: 'pre_claude_spawn', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
-
-			// 3. Run claude. Spawned with default env (process.env) — workspace
-			//    JWT is held in a JS variable scoped to this request handler,
-			//    not in the env. claude can read its OWN env via bash, but not
-			//    this server's JS heap.
-			const args = buildClaudeArgs(envelope);
-			await runProc('claude', args, res, emit);
+			// 2. Run claude. runPersistentClaude reuses the same process across
+			//    turns when args + token match — only the first turn pays the
+			//    ~20-25s OAuth handshake cost. Subsequent turns are ~2-3s.
+			//    Credentials wipe + write happens INSIDE runPersistentClaude
+			//    when (and only when) a respawn is needed.
+			await runPersistentClaude(envelope, res, emit);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 
 			// 4. Push workspace back to R2 via Worker so the next turn sees it.
@@ -521,109 +780,19 @@ const server = http.createServer(async (req, res) => {
 		try {
 			res.end();
 		} catch { /* connection closed */ }
-		// Allow response to flush, then exit. Machine auto-destroys.
-		setTimeout(() => process.exit(0), 250);
+		// Long-running server: DO NOT exit here. Keep the persistent claude
+		// process alive so the NEXT /run (same Fly Machine via pool reuse)
+		// can skip the OAuth handshake. Machine destruction is now driven by
+		// PoolManagerDO (Worker side) when this sandbox goes idle past the
+		// configured timeout — not by self-exit. The idle watchdog below is
+		// a defensive fallback in case the pool manager misses us.
+		inFlight = false;
+		lastRunAt = nowMs();
 	}
 });
 
-/** Spawn a process, pipe stdout chunks raw to the response (claude case). */
-function runProc(command, args, res, emit) {
-	return new Promise((resolve) => {
-		const t_spawn_called = nowMs();
-
-		const proc = spawn(command, args, {
-			cwd: process.env.RUN_CWD || '/workspace',
-			env: process.env,
-			stdio: ['ignore', 'pipe', 'pipe'],
-		});
-
-		// Phase markers — emit BEFORE forwarding chunks so the worker translator
-		// captures them in order. These let us see what's slow INSIDE claude:
-		//   claude_spawned        — spawn() returned (proc has pid)
-		//   claude_first_stdout   — Node/CLI booted, first byte written
-		//   claude_first_system   — first stream-json system event (CLI initialized,
-		//                           MCP loaded, ready for inference)
-		//   claude_first_assistant — first text/thinking event from Anthropic
-		//                            (this is the REAL "Claude responded" moment)
-		const t_spawn_returned = nowMs();
-		emit('phase', { name: 'claude_spawned', ts: t_spawn_returned, since_spawn_call_ms: t_spawn_returned - t_spawn_called });
-
-		let firstStdoutSeen = false;
-		let firstSystemSeen = false;
-		let firstAssistantSeen = false;
-		let lineBuffer = '';
-
-		function inspectLine(line) {
-			if (!line) return;
-			let obj;
-			try { obj = JSON.parse(line); } catch { return; }
-			if (!obj || typeof obj !== 'object') return;
-			const type = obj.type;
-			if (!firstSystemSeen && type === 'system') {
-				firstSystemSeen = true;
-				const t = nowMs();
-				emit('phase', { name: 'claude_first_system', ts: t, since_spawn_call_ms: t - t_spawn_called });
-			}
-			if (!firstAssistantSeen && (type === 'assistant' || type === 'text' || type === 'content_block_start')) {
-				firstAssistantSeen = true;
-				const t = nowMs();
-				emit('phase', { name: 'claude_first_assistant', ts: t, since_spawn_call_ms: t - t_spawn_called });
-			}
-		}
-
-		// claude already emits stream-json (ndjson). Forward raw — saves CPU + preserves
-		// the chatagentico-style frame structure that the runner translator expects.
-		proc.stdout.on('data', (chunk) => {
-			if (!firstStdoutSeen) {
-				firstStdoutSeen = true;
-				const t = nowMs();
-				emit('phase', { name: 'claude_first_stdout', ts: t, since_spawn_call_ms: t - t_spawn_called });
-			}
-			// Buffer & inspect line-by-line (best-effort — we still forward raw bytes).
-			try {
-				lineBuffer += chunk.toString('utf8');
-				let nl;
-				while ((nl = lineBuffer.indexOf('\n')) >= 0) {
-					const line = lineBuffer.slice(0, nl).trim();
-					lineBuffer = lineBuffer.slice(nl + 1);
-					inspectLine(line);
-				}
-			} catch { /* parse errors never block streaming */ }
-			try {
-				res.write(chunk);
-			} catch { /* ignore */ }
-		});
-
-		// Stderr: emit as warn-level event so client sees it but doesn't fail.
-		const stderrBuf = [];
-		proc.stderr.on('data', (chunk) => {
-			stderrBuf.push(chunk);
-			// Cap to 64KB to avoid runaway memory.
-			let total = 0;
-			for (const b of stderrBuf) total += b.length;
-			while (total > 65536 && stderrBuf.length > 1) {
-				const removed = stderrBuf.shift();
-				total -= removed.length;
-			}
-		});
-
-		proc.on('error', (err) => {
-			emit('error', { code: 'spawn_failed', message: err.message, retryable: false });
-			resolve();
-		});
-		proc.on('exit', (code) => {
-			if (code !== 0) {
-				const tail = Buffer.concat(stderrBuf).toString('utf8').slice(-512);
-				emit('error', {
-					code: 'exit_nonzero',
-					message: `${command} exited ${code}${tail ? `\nstderr (tail): ${tail}` : ''}`,
-					retryable: false,
-				});
-			}
-			resolve();
-		});
-	});
-}
+// (Legacy one-shot runProc removed — long-running flow uses runPersistentClaude.
+// build/exec modes still use runProcLogs below for non-claude commands.)
 
 /** Spawn for build/exec modes — stdout/stderr both wrapped as `log` events. */
 function runProcLogs(command, args, env, emit) {
@@ -654,13 +823,21 @@ server.listen(PORT, HOST, () => {
 	logInfo('SmoothAgent runtime server listening', { port: PORT });
 });
 
-// If we don't get a request within 5 minutes of boot, exit (defensive).
-setTimeout(() => {
-	if (!inFlight) {
-		logError('No /run after 5 min, exiting');
-		process.exit(2);
+// Idle watchdog — defensive fallback. The Worker-side PoolManagerDO is the
+// primary mechanism that destroys idle Fly Machines, but in case it misses us
+// (DO restart, alarm drift, network blip) we self-exit after 35 minutes of
+// no /run traffic. This is slightly longer than the pool's default 30-min
+// idleTimeoutMs so the pool's stop() lands first under normal conditions.
+const IDLE_EXIT_MS = 35 * 60 * 1000;
+setInterval(() => {
+	if (inFlight) return;
+	const idle = nowMs() - lastRunAt;
+	if (idle > IDLE_EXIT_MS) {
+		logError('idle for too long, exiting', { idleMs: idle });
+		if (claudeProc) { try { claudeProc.kill('SIGTERM'); } catch {} }
+		setTimeout(() => process.exit(2), 1000);
 	}
-}, 5 * 60 * 1000);
+}, 60_000);
 
 // Graceful shutdown — let inflight finish.
 const onSig = (sig) => {
