@@ -1,8 +1,17 @@
 # smoothagent/cc-base
 
-The base container image for SmoothAgent ephemeral agent runs.
+The base container image for SmoothAgent agent runs.
 
-This image is intentionally tiny: Claude Code CLI, a non-root user, and a small entrypoint that reads a JSON envelope on stdin and dispatches to the right execution mode. Customers extend it to bring their own tools and scaffolds.
+> **Architecture v2 (2026-05-14)**: this image is no longer ephemeral-per-turn.
+> The Fly Machine lives for many turns (managed by `core`'s `PoolManagerDO`),
+> and inside it a single `claude` CLI process is kept alive across `/run`
+> calls via `--input-format stream-json`. The ~20s OAuth handshake is paid
+> ONCE per machine boot, not per turn. See `server.js:runPersistentClaude`
+> for the lifecycle and `core/PLAN.md` for the full architecture.
+
+This image runs an HTTP server (`/opt/smoothagent/server.js`) on port 8080
+that accepts envelopes over `POST /run` and drives the long-running claude
+process internally. Customers extend it to bring their own tools and scaffolds.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -10,7 +19,7 @@ This image is intentionally tiny: Claude Code CLI, a non-root user, and a small 
 │   FROM node:22-slim                          │
 │   + Claude Code CLI                          │
 │   + non-root user (uid 996)                  │
-│   + /opt/smoothagent/entrypoint.sh           │
+│   + /opt/smoothagent/server.js (HTTP :8080)  │
 │   + tini, jq, ca-certs, git                  │
 └──────────────────────────────────────────────┘
                     │
@@ -24,10 +33,11 @@ This image is intentionally tiny: Claude Code CLI, a non-root user, and a small 
 │   ENV BUILD_CMD="npm run build"              │
 └──────────────────────────────────────────────┘
                     │
-                    │ used by
+                    │ pulled by
                     ▼
-            SmoothAgent runner
-            (Fly Machines API, ephemeral per turn)
+       SmoothAgent core (RunnerDO + PoolManagerDO)
+       Fly Machines pool with sticky containerKey;
+       long-running claude per machine.
 ```
 
 ## Why image-as-contract
