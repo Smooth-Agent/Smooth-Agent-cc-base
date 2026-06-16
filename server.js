@@ -576,15 +576,20 @@ async function runPersistentClaude(envelope, res, emit) {
 	const newTokenHash = tokenHash(envelope.ccToken);
 
 	// Decide: reuse, or kill+respawn?
+	// forceRespawn: set by the Worker on the FIRST /run after a Detona resume.
+	// A resumed microVM restores the claude PROCESS but its open HTTPS connection
+	// to Anthropic is dead — reusing it hangs ~20-56s. So we kill+respawn (cheap:
+	// auth + workspace survive on disk, only the process is rebuilt ~1.4s).
 	const needsRespawn =
 		!claudeProc ||
 		claudeProc.exitCode !== null ||
 		claudeSig !== newSig ||
-		claudeTokenHash !== newTokenHash;
+		claudeTokenHash !== newTokenHash ||
+		envelope.forceRespawn === true;
 
 	if (needsRespawn) {
 		if (claudeProc) {
-			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: claudeSig !== newSig ? 'args_changed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead') });
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newSig ? 'args_changed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead')) });
 			await killClaude('respawn');
 		}
 		// Refresh credentials.json on disk and (only on first ever turn) wipe
