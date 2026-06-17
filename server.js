@@ -29,11 +29,14 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { TurnRelay } = require('./relay');
 
 const PORT = 8080;
 const HOST = '0.0.0.0';
 
 let inFlight = false;
+/** The current turn's relay (retain/send/save). GET /stream attaches to it. */
+let currentRelay = null;
 
 // ---------------------------------------------------------------------------
 // PERSISTENT CLAUDE PROCESS — the heart of the long-running optimization.
@@ -532,8 +535,9 @@ function handleClaudeStdout(chunk) {
 		t.emit('phase', { name: 'claude_first_stdout', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
 	}
 
-	// Forward raw chunk to caller (preserves frame alignment for translator).
-	try { t.res.write(chunk); } catch { /* connection closed */ }
+	// Forward raw chunk through the relay (buffers for F5 replay + fans out to
+	// every live sink — preserves frame alignment for the translator).
+	t.relay.write(chunk);
 
 	// Parse line-by-line for terminal/phase detection.
 	stdoutLineBuffer += chunk.toString('utf8');
@@ -556,9 +560,15 @@ function handleClaudeStdout(chunk) {
 			t.emit('phase', { name: 'claude_first_assistant', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
 		}
 		if (type === 'result') {
-			// Turn finished — release the caller.
+			// Claude finished. Capture the final text + usage for the SAVE
+			// callback, but don't complete the relay yet — sync_up + post_claude
+			// events still stream after this. complete() fires at end of /run.
 			const turn = activeTurn;
 			activeTurn = null;
+			turn.relay.pendingResult = {
+				text: typeof obj.result === 'string' ? obj.result : '',
+				usage: obj.usage || null,
+			};
 			turn.resolve();
 		}
 	}
@@ -571,7 +581,7 @@ function handleClaudeStdout(chunk) {
  * changed since last turn. Otherwise reuses the existing process — that's
  * where the time savings come from.
  */
-async function runPersistentClaude(envelope, res, emit) {
+async function runPersistentClaude(envelope, relay, emit) {
 	const newSig = sessionSignature(envelope);
 	const newTokenHash = tokenHash(envelope.ccToken);
 
@@ -602,7 +612,7 @@ async function runPersistentClaude(envelope, res, emit) {
 		spawnPersistentClaude(envelope);
 		emit('phase', { name: 'claude_spawned', ts: nowMs(), since_spawn_call_ms: nowMs() - t_spawn_called });
 		activeTurn = {
-			res, emit, t_spawn: t_spawn_called,
+			relay, emit, t_spawn: t_spawn_called,
 			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
 			resolve: null,
 		};
@@ -610,7 +620,7 @@ async function runPersistentClaude(envelope, res, emit) {
 		// Warm path — reuse existing process. No spawn cost.
 		emit('phase', { name: 'claude_reused', ts: nowMs() });
 		activeTurn = {
-			res, emit, t_spawn: nowMs(),
+			relay, emit, t_spawn: nowMs(),
 			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
 			resolve: null,
 		};
@@ -641,6 +651,20 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && req.url === '/health') {
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ status: 'ok', inFlight }));
+		return;
+	}
+
+	// F5 / reconnect: attach to the current turn's relay — replay everything
+	// buffered so far, then tail live. No active turn → 204, Worker reads D1.
+	// Agent-agnostic: works for any adapter that drives the relay.
+	if (req.method === 'GET' && req.url === '/stream') {
+		if (!currentRelay) { res.writeHead(204).end(); return; }
+		res.writeHead(200, {
+			'Content-Type': 'application/x-ndjson',
+			'Cache-Control': 'no-cache, no-store',
+			'X-Accel-Buffering': 'no',
+		});
+		currentRelay.addSink(res);
 		return;
 	}
 
@@ -689,12 +713,19 @@ const server = http.createServer(async (req, res) => {
 		'X-Accel-Buffering': 'no',
 	});
 
+	// Per-turn relay: RETAIN (buffer for F5 replay) · SEND (fan-out to sinks) ·
+	// SAVE (callback to the Worker on completion). Agent-agnostic — the claude
+	// path below just feeds it. The /run caller is sink #0; /stream adds more.
+	const relay = new TurnRelay({
+		chatId: envelope.chatId || (envelope.workspaceProxy && envelope.workspaceProxy.chatId) || null,
+		promptId: envelope.promptId || null,
+		callback: envelope.callback && envelope.callback.url ? envelope.callback : null,
+	});
+	currentRelay = relay;
+	relay.addSink(res);
+
 	function emit(type, data) {
-		try {
-			res.write(JSON.stringify({ type, data, ts: nowMs() }) + '\n');
-		} catch {
-			// Connection closed; ignore.
-		}
+		relay.write(JSON.stringify({ type, data, ts: nowMs() }) + '\n');
 	}
 
 	// Always emit a leading 'ready' event so client knows server is alive.
@@ -739,7 +770,7 @@ const server = http.createServer(async (req, res) => {
 			//    ~20-25s OAuth handshake cost. Subsequent turns are ~2-3s.
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
-			await runPersistentClaude(envelope, res, emit);
+			await runPersistentClaude(envelope, relay, emit);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 
 			// 4. Push workspace back to R2 via Worker so the next turn sees it.
@@ -782,15 +813,22 @@ const server = http.createServer(async (req, res) => {
 			retryable: false,
 		});
 	} finally {
+		// SAVE + close: complete the relay — ends every sink (incl. this res) and
+		// fires the Worker callback to persist text+usage (the single D1 writer).
+		// Awaited so the ephemeral container never drops the save. currentRelay is
+		// left pointing at the finished relay (done=true): a late F5 hitting
+		// /stream still gets the whole turn replayed from its buffer until the
+		// next /run replaces it. Never let teardown throw.
 		try {
-			res.end();
-		} catch { /* connection closed */ }
+			const out = await relay.complete(relay.pendingResult || {});
+			if (out && out.ok === false) logError('save callback failed', { status: out.status, error: out.error });
+		} catch (e) {
+			logError('relay.complete threw', { msg: e && e.message });
+		}
 		// Long-running server: DO NOT exit here. Keep the persistent claude
-		// process alive so the NEXT /run (same Fly Machine via pool reuse)
-		// can skip the OAuth handshake. Machine destruction is now driven by
-		// PoolManagerDO (Worker side) when this sandbox goes idle past the
-		// configured timeout — not by self-exit. The idle watchdog below is
-		// a defensive fallback in case the pool manager misses us.
+		// process alive so the NEXT /run (same machine via pool reuse) can skip
+		// the OAuth handshake. Machine destruction is driven by the Worker when
+		// the sandbox goes idle. The idle watchdog below is a defensive fallback.
 		inFlight = false;
 		lastRunAt = nowMs();
 	}

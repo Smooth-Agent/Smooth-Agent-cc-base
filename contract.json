@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SmoothAgent cc-base entrypoint contract",
   "description": "Wire format the entrypoint accepts on stdin and emits on stdout.",
-  "version": "1.0.0",
+  "version": "1.1.0",
 
   "input": {
     "type": "object",
@@ -36,6 +36,17 @@
         "type": "object",
         "additionalProperties": { "type": "string" },
         "description": "Environment overrides exported before execution."
+      },
+      "chatId": { "type": "string", "description": "Chat id this turn belongs to (echoed back in the completion callback)." },
+      "promptId": { "type": "string", "description": "Prompt/turn id (echoed back in the completion callback so the Worker can persist the right row)." },
+      "callback": {
+        "type": "object",
+        "description": "Where the container POSTs the final result on completion, so persistence never depends on a client staying connected. The Worker is the single D1 writer. Same short-lived-JWT trust model as workspaceProxy.",
+        "properties": {
+          "url": { "type": "string", "description": "Worker endpoint (e.g. https://.../internal/chat-result)." },
+          "jwt": { "type": "string", "description": "Short-lived bearer token; sent as Authorization: Bearer." }
+        },
+        "required": ["url"]
       }
     }
   },
@@ -67,6 +78,14 @@
     "passthrough": {
       "description": "When mode=cc-cli, the Claude Code CLI streams its own stream-json events directly. The entrypoint emits only the leading 'ready' event and then execs claude, so all subsequent stdout lines are CC's native event format. The runner unwraps these and re-emits them in its own SSE protocol."
     }
+  },
+
+  "http": {
+    "description": "The runtime is a long-running HTTP server (port 8080). A per-turn relay buffers output, fans it out to live connections, and POSTs the result on completion — agent-agnostic, so any future agent adapter reuses it.",
+    "POST /run": "Run one turn with the input envelope. Streams NDJSON {type,data,ts} events back. Rejects 409 if a turn is already in flight.",
+    "GET /stream": "Reconnect (F5): replays the current turn's buffered events from the start, then tails live. 204 when no turn is active (caller reads persisted history instead).",
+    "GET /health": "Liveness: {status:'ok', inFlight}.",
+    "completion_callback": "On turn completion the container POSTs {chatId, promptId, text, usage} to callback.url (Authorization: Bearer callback.jwt). Best-effort; the Worker persists. Fires whether or not any client is connected."
   },
 
   "exit_codes": {
