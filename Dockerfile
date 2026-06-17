@@ -50,6 +50,9 @@ RUN ARCH=$(dpkg --print-architecture) \
 COPY --chown=root:root --chmod=0755 entrypoint.sh /opt/smoothagent/entrypoint.sh
 COPY --chown=root:root --chmod=0644 contract.json /opt/smoothagent/contract.json
 COPY --chown=root:root --chmod=0755 server.js /opt/smoothagent/server.js
+# relay.js — required by server.js (per-turn retain/send/save transport). MUST be
+# copied or the HTTP /run path fails with "Cannot find module './relay'".
+COPY --chown=root:root --chmod=0644 relay.js /opt/smoothagent/relay.js
 
 # HTTP server port. Runner spawns the machine with init.cmd pointing at server.js;
 # Fly routes app traffic to this port via [services] config.
