@@ -67,6 +67,13 @@ let activeTurn = null;
 let stdoutLineBuffer = '';
 /** Time of last /run completion (for the idle-exit watchdog). */
 let lastRunAt = Date.now();
+/**
+ * Fingerprint of the workspace files synced into THIS container. A warm container
+ * already holds the workspace locally, so we only re-sync from R2 when this is a
+ * fresh container (null) or the fingerprint changed (a new/removed upload). null
+ * until the first successful sync, so a cold container always syncs.
+ */
+let lastSyncedFingerprint = null;
 
 // ---------------------------------------------------------------------------
 // Workspace proxy sync.
@@ -752,16 +759,26 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 
-			// 1. Pull last-turn workspace from R2 via Worker (noop on first turn).
+			// 1. Pull last-turn workspace from R2 via Worker — but ONLY when it could
+			//    have changed. A warm container with the same file fingerprint already
+			//    holds the workspace locally (claude's own writes included), so a
+			//    re-sync is pure waste (~0.5s). Cold container (null) or a changed
+			//    fingerprint (new/removed upload) → sync.
 			if (proxy) {
-				emit('sync_down_start', {});
-				const downResult = await syncFromWorker(proxy, workspaceDir);
-				if (downResult.ok === false) {
-					logError('sync_down failed', { error: downResult.error, errors: downResult.errors });
-					emit('sync_down_done', { ok: false, ms: downResult.ms, error: downResult.error });
-					// Don't fail the turn — claude can still run with empty workspace.
+				const wsFp = envelope.wsFingerprint || '';
+				if (lastSyncedFingerprint === wsFp) {
+					emit('sync_down_done', { ok: true, ms: 0, skipped: 'warm_unchanged' });
 				} else {
-					emit('sync_down_done', { ok: true, ms: downResult.ms, count: downResult.count });
+					emit('sync_down_start', {});
+					const downResult = await syncFromWorker(proxy, workspaceDir);
+					if (downResult.ok === false) {
+						logError('sync_down failed', { error: downResult.error, errors: downResult.errors });
+						emit('sync_down_done', { ok: false, ms: downResult.ms, error: downResult.error });
+						// Don't fail the turn — claude can still run with empty workspace.
+					} else {
+						lastSyncedFingerprint = wsFp;
+						emit('sync_down_done', { ok: true, ms: downResult.ms, count: downResult.count });
+					}
 				}
 			}
 
