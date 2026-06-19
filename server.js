@@ -759,12 +759,13 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 
-			// 1. Pull last-turn workspace from R2 via Worker — but ONLY when it could
-			//    have changed. A warm container with the same file fingerprint already
-			//    holds the workspace locally (claude's own writes included), so a
-			//    re-sync is pure waste (~0.5s). Cold container (null) or a changed
-			//    fingerprint (new/removed upload) → sync.
-			if (proxy) {
+			// 1. Pull last-turn workspace from R2 via Worker.
+			// ── SYNC DISABLED (decisão temporária) ────────────────────────────
+			// R2 workspace sync is OFF for now. CC chat carries context via D1
+			// priorContext, not files, so the sync was pure latency. To re-enable,
+			// change `false && proxy` back to `proxy` here AND in the sync_up below.
+			// (The skip-when-warm logic + wsFingerprint stay wired for when it's on.)
+			if (false && proxy) {
 				const wsFp = envelope.wsFingerprint || '';
 				if (lastSyncedFingerprint === wsFp) {
 					emit('sync_down_done', { ok: true, ms: 0, skipped: 'warm_unchanged' });
@@ -791,9 +792,9 @@ const server = http.createServer(async (req, res) => {
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 
 			// 4. Push workspace back to R2 via Worker so the next turn sees it.
-			//    Best-effort: failures are logged + emitted but never mask
-			//    claude's own output.
-			if (proxy) {
+			// ── SYNC DISABLED (decisão temporária) — pair of the sync_down above.
+			//    Re-enable by changing `false && proxy` back to `proxy`.
+			if (false && proxy) {
 				emit('sync_up_start', {});
 				try {
 					const upResult = await syncToWorker(proxy, workspaceDir);
