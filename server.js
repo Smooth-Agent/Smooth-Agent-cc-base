@@ -831,6 +831,16 @@ const server = http.createServer(async (req, res) => {
 			retryable: false,
 		});
 	} finally {
+		// Release the turn lock BEFORE closing the stream. relay.complete() ends the
+		// `res` sink, and Detona's pauseAfter freezes the box the instant that stream
+		// closes. If inFlight were still true at that moment, the box would FREEZE
+		// with the lock held → on resume the next /run sees inFlight=true and returns
+		// 409 'already_running' (the turn comes back empty). The turn is logically
+		// done here — claude has finished; relay.complete is just persistence + close
+		// — so clearing the lock first is correct AND makes the freeze always catch
+		// the box idle. (This was the empty-2nd-message bug under pauseAfter.)
+		inFlight = false;
+		lastRunAt = nowMs();
 		// SAVE + close: complete the relay — ends every sink (incl. this res) and
 		// fires the Worker callback to persist text+usage (the single D1 writer).
 		// Awaited so the ephemeral container never drops the save. currentRelay is
@@ -843,12 +853,6 @@ const server = http.createServer(async (req, res) => {
 		} catch (e) {
 			logError('relay.complete threw', { msg: e && e.message });
 		}
-		// Long-running server: DO NOT exit here. Keep the persistent claude
-		// process alive so the NEXT /run (same machine via pool reuse) can skip
-		// the OAuth handshake. Machine destruction is driven by the Worker when
-		// the sandbox goes idle. The idle watchdog below is a defensive fallback.
-		inFlight = false;
-		lastRunAt = nowMs();
 	}
 });
 
