@@ -50,16 +50,18 @@ let currentRelay = null;
 // no OAuth handshake. ~2-3s warm cost.
 //
 // When the args that materially affect Claude's behavior change between
-// turns (model swap, system-prompt change, MCP config change, OR token
-// rotation), the prior process is killed and a new one spawned. Cold cost
-// again on that turn, but rare.
+// turns (model swap, system-prompt change, MCP config change), the prior
+// process is killed and a new one spawned. Cold cost again on that turn, but
+// rare. A rotated ccToken does NOT respawn — it's a credential, not a behavior
+// change, so it's swapped in place (.credentials.json rewritten, process kept).
 // ---------------------------------------------------------------------------
 
 /** Currently-running claude process. Null when no claude has been spawned (or it crashed/was killed). */
 let claudeProc = null;
 /** Hash of model+systemPrompt+maxTurns+mcpConfig the running claude was started with. */
 let claudeSig = null;
-/** Last ccToken written to .credentials.json. If a new turn brings a different token, respawn. */
+/** Last ccToken written to .credentials.json. A new turn with a different token is
+ *  swapped in place (credentials rewritten, process reused) — NOT a respawn. */
 let claudeTokenHash = null;
 /** Per-turn handler binding — null when no /run is in flight. */
 let activeTurn = null;
@@ -597,11 +599,15 @@ async function runPersistentClaude(envelope, relay, emit) {
 	// A resumed microVM restores the claude PROCESS but its open HTTPS connection
 	// to Anthropic is dead — reusing it hangs ~20-56s. So we kill+respawn (cheap:
 	// auth + workspace survive on disk, only the process is rebuilt ~1.4s).
+	// A rotated ccToken is NOT a reason to respawn — it's a credential, not a
+	// behavior change. Respawning to re-key threw away the warm in-memory session
+	// (forcing a context refold, tokIn ~2470) for nothing. The token is now swapped
+	// in place in the reuse branch below. Only model/system/mcp changes (claudeSig),
+	// a dead process, or the Worker's post-resume forceRespawn actually respawn.
 	const needsRespawn =
 		!claudeProc ||
 		claudeProc.exitCode !== null ||
 		claudeSig !== newSig ||
-		claudeTokenHash !== newTokenHash ||
 		envelope.forceRespawn === true;
 
 	if (needsRespawn) {
@@ -625,6 +631,16 @@ async function runPersistentClaude(envelope, relay, emit) {
 		};
 	} else {
 		// Warm path — reuse existing process. No spawn cost.
+		// TOKEN SWAP (not respawn): the ccToken rotates ~hourly, but rotating it does
+		// NOT change claude's behavior. Rewrite .credentials.json in place and update the
+		// tracked hash; claude re-reads it on its next self-refresh, and its still-valid
+		// in-memory token keeps working until then. Do NOT wipeClaudeState() here — the
+		// session lockfiles/caches are exactly the warmth we're keeping (that's the win).
+		if (claudeTokenHash !== newTokenHash) {
+			configureCcAuth(envelope.ccToken);
+			claudeTokenHash = newTokenHash;
+			emit('phase', { name: 'claude_token_swapped', ts: nowMs() });
+		}
 		emit('phase', { name: 'claude_reused', ts: nowMs() });
 		activeTurn = {
 			relay, emit, t_spawn: nowMs(),
