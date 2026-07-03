@@ -58,8 +58,10 @@ let currentRelay = null;
 
 /** Currently-running claude process. Null when no claude has been spawned (or it crashed/was killed). */
 let claudeProc = null;
-/** Hash of model+systemPrompt+maxTurns+mcpConfig the running claude was started with. */
+/** Core signature (systemPrompt+maxTurns+mcpConfig) the running claude was started with. */
 let claudeSig = null;
+/** Model the running claude is CURRENTLY on (spawn arg, or last in-flight set_model). */
+let claudeModel = null;
 /** Last ccToken written to .credentials.json. A new turn with a different token is
  *  swapped in place (credentials rewritten, process reused) — NOT a respawn. */
 let claudeTokenHash = null;
@@ -433,6 +435,53 @@ function sessionSignature(envelope) {
 }
 
 /**
+ * Signature WITHOUT the model. The model is a per-REQUEST parameter to the
+ * Anthropic API, not process identity — same CC, same context, any model
+ * (interactive claude has /model for exactly this). When ONLY the model differs
+ * between turns we attempt an IN-FLIGHT switch via a stream-json control_request
+ * (subtype set_model) instead of killing the warm process; kill+respawn remains
+ * the fallback when the CLI doesn't ack. systemPrompt/maxTurns/mcp still respawn
+ * (those ARE process identity: spawn args that rebuild the session).
+ */
+function coreSignature(envelope) {
+	return JSON.stringify({
+		systemPrompt: envelope.systemPrompt || null,
+		maxTurns: envelope.maxTurns || null,
+		mcpConfig: envelope.mcpConfig || null,
+	});
+}
+
+/** Pending control_request acks (request_id → resolve). See trySetModel. */
+const controlWaiters = new Map();
+
+/**
+ * Ask the running claude to switch model in-flight (stream-json control channel).
+ * Resolves true on an acked success, false on error/timeout — caller falls back
+ * to the legacy kill+respawn, so an older CLI that ignores the subtype only costs
+ * `timeoutMs` once per model switch, never correctness.
+ */
+function trySetModel(model, timeoutMs) {
+	return new Promise((resolve) => {
+		if (!claudeProc || claudeProc.exitCode !== null) return resolve(false);
+		const id = `sm_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+		const timer = setTimeout(() => { controlWaiters.delete(id); resolve(false); }, timeoutMs);
+		controlWaiters.set(id, (resp) => {
+			clearTimeout(timer);
+			controlWaiters.delete(id);
+			const sub = resp && resp.response ? resp.response.subtype : undefined;
+			resolve(sub === 'success' || (!!resp && !resp.error && sub !== 'error'));
+		});
+		try {
+			claudeProc.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'set_model', model } }) + '\n');
+		} catch {
+			clearTimeout(timer);
+			controlWaiters.delete(id);
+			resolve(false);
+		}
+	});
+}
+
+/**
  * Cheap fingerprint of the ccToken — we never store the token raw in any
  * variable that could end up in stderr/error chains; just a short hash so
  * we can detect rotation between turns.
@@ -454,6 +503,7 @@ async function killClaude(reason) {
 	const proc = claudeProc;
 	claudeProc = null;
 	claudeSig = null;
+	claudeModel = null;
 	claudeTokenHash = null;
 	stdoutLineBuffer = '';
 	try { proc.kill('SIGTERM'); } catch { /* already dead */ }
@@ -512,13 +562,15 @@ function spawnPersistentClaude(envelope) {
 		if (claudeProc === proc) {
 			claudeProc = null;
 			claudeSig = null;
+			claudeModel = null;
 			claudeTokenHash = null;
 			stdoutLineBuffer = '';
 		}
 	});
 
 	claudeProc = proc;
-	claudeSig = sessionSignature(envelope);
+	claudeSig = coreSignature(envelope);
+	claudeModel = envelope.model || null;
 	claudeTokenHash = tokenHash(envelope.ccToken);
 	return proc;
 }
@@ -535,6 +587,20 @@ function spawnPersistentClaude(envelope) {
  * record them in /timing/cc.
  */
 function handleClaudeStdout(chunk) {
+	// control_response acks (e.g. set_model) can arrive BETWEEN turns — resolve
+	// waiters before the activeTurn gate or they'd be dropped and time out.
+	if (controlWaiters.size > 0) {
+		for (const line of chunk.toString('utf8').split('\n')) {
+			const s = line.trim();
+			if (!s || s.indexOf('control_response') === -1) continue;
+			try {
+				const obj = JSON.parse(s);
+				const rid = (obj.response && obj.response.request_id) || obj.request_id;
+				const w = rid && controlWaiters.get(rid);
+				if (w) w(obj);
+			} catch { /* partial line — the waiter's timeout covers it */ }
+		}
+	}
 	if (!activeTurn) return;
 	const t = activeTurn;
 
@@ -591,8 +657,29 @@ function handleClaudeStdout(chunk) {
  * where the time savings come from.
  */
 async function runPersistentClaude(envelope, relay, emit) {
-	const newSig = sessionSignature(envelope);
+	const newCore = coreSignature(envelope);
+	const newModel = envelope.model || null;
 	const newTokenHash = tokenHash(envelope.ccToken);
+
+	// MODEL SWAP (not respawn): the model is a per-request API parameter — same CC,
+	// same context, any model. When ONLY the model differs, ask the running claude to
+	// switch in-flight (control_request set_model, the same channel interactive
+	// /model uses). Ack → warm reuse on the new model; no ack (older CLI) → the
+	// mismatch below falls through to the legacy respawn. Worst case = one 2s
+	// timeout per switch; best case kills the model-switch respawn entirely.
+	if (
+		claudeProc && claudeProc.exitCode === null &&
+		claudeSig === newCore && claudeModel !== newModel &&
+		envelope.forceRespawn !== true
+	) {
+		const swapped = await trySetModel(newModel, 2000);
+		if (swapped) {
+			claudeModel = newModel;
+			emit('phase', { name: 'claude_model_swapped', ts: nowMs(), model: newModel });
+		} else {
+			emit('phase', { name: 'claude_model_swap_refused', ts: nowMs(), model: newModel });
+		}
+	}
 
 	// Decide: reuse, or kill+respawn?
 	// forceRespawn: set by the Worker on the FIRST /run after a Detona resume.
@@ -602,17 +689,19 @@ async function runPersistentClaude(envelope, relay, emit) {
 	// A rotated ccToken is NOT a reason to respawn — it's a credential, not a
 	// behavior change. Respawning to re-key threw away the warm in-memory session
 	// (forcing a context refold, tokIn ~2470) for nothing. The token is now swapped
-	// in place in the reuse branch below. Only model/system/mcp changes (claudeSig),
-	// a dead process, or the Worker's post-resume forceRespawn actually respawn.
+	// in place in the reuse branch below. Only systemPrompt/maxTurns/mcp changes
+	// (core signature), a failed model swap, a dead process, or the Worker's
+	// post-resume forceRespawn actually respawn.
 	const needsRespawn =
 		!claudeProc ||
 		claudeProc.exitCode !== null ||
-		claudeSig !== newSig ||
+		claudeSig !== newCore ||
+		claudeModel !== newModel ||
 		envelope.forceRespawn === true;
 
 	if (needsRespawn) {
 		if (claudeProc) {
-			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newSig ? 'args_changed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead')) });
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newCore ? 'args_changed' : (claudeModel !== newModel ? 'model_swap_failed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead'))) });
 			await killClaude('respawn');
 		}
 		// Refresh credentials.json on disk and (only on first ever turn) wipe
