@@ -29,6 +29,7 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { TurnRelay } = require('./relay');
 
 const PORT = 8080;
@@ -372,21 +373,86 @@ function wipeClaudeState() {
 }
 
 /** Configure Claude Code OAuth credentials. Call AFTER wipeClaudeState. */
-function configureCcAuth(token) {
+/**
+ * Write the FULL OAuth pair. The doctrine (owner-defined 2026-07-05): the ONLY
+ * thing that ever refreshes a CC token is CLAUDE ITSELF, in here, naturally —
+ * the platform never calls Anthropic's refresh endpoint. That only works if
+ * claude HAS the refresh token (this file used to write access-only, which made
+ * self-refresh impossible and silently forced the platform into worker-side
+ * rotation). expiresAt lets claude know when to rotate.
+ */
+function configureCcAuth(token, refreshToken, expiresAt) {
 	const homeDir = process.env.HOME || '/workspace';
 	const ccDir = path.join(homeDir, '.claude');
 	fs.mkdirSync(ccDir, { recursive: true, mode: 0o700 });
 	fs.writeFileSync(
-		path.join(ccDir, '.credentials.json'),
+		CRED_FILE_PATH(),
 		JSON.stringify({
 			claudeAiOauth: {
 				accessToken: token,
+				...(refreshToken ? { refreshToken } : {}),
+				...(expiresAt ? { expiresAt: typeof expiresAt === 'number' ? expiresAt : Date.parse(expiresAt) } : {}),
 				scopes: ['user:inference'],
 			},
 		}),
 		{ mode: 0o600 },
 	);
+	credFileLastReported = credFileFingerprint();
 }
+
+function CRED_FILE_PATH() {
+	return path.join(process.env.HOME || '/workspace', '.claude', '.credentials.json');
+}
+
+/** Cheap change detector for the credentials file (never logs contents). */
+function credFileFingerprint() {
+	try {
+		const raw = fs.readFileSync(CRED_FILE_PATH(), 'utf8');
+		return crypto.createHash('sha256').update(raw).digest('hex');
+	} catch { return ''; }
+}
+
+let credFileLastReported = '';
+let credWatcherStarted = false;
+
+/**
+ * CREDENTIAL WATCHER — the capture half of the doctrine. claude rotates the
+ * token by rewriting .credentials.json; the moment that happens we report the
+ * new pair to the Worker (dedicated endpoint, signed callback JWT) so the
+ * SOURCE OF TRUTH is updated immediately — not at turn end, not never. The
+ * Worker also re-forks the golden with the new key, in parallel, on its side.
+ * fs.watch + a post-turn sweep (belt and suspenders; fs.watch can miss on
+ * overlayfs). Token contents never logged.
+ */
+function startCredWatcher(callback) {
+	if (credWatcherStarted || !callback || !callback.url) return;
+	credWatcherStarted = true;
+	const report = async () => {
+		try {
+			const fp = credFileFingerprint();
+			if (!fp || fp === credFileLastReported) return;
+			const cred = JSON.parse(fs.readFileSync(CRED_FILE_PATH(), 'utf8')).claudeAiOauth || {};
+			if (!cred.accessToken) return;
+			credFileLastReported = fp;
+			const url = callback.url.replace(/\/internal\/chat-result$/, '/internal/cc-credentials');
+			const r = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(callback.jwt ? { Authorization: `Bearer ${callback.jwt}` } : {}) },
+				body: JSON.stringify({ credentials: { accessToken: cred.accessToken, refreshToken: cred.refreshToken || null, expiresAt: cred.expiresAt || null } }),
+			});
+			logInfo('cred rotation reported', { status: r.status });
+		} catch (e) {
+			logError('cred report failed', { msg: e && e.message });
+		}
+	};
+	try {
+		fs.watch(path.dirname(CRED_FILE_PATH()), { persistent: false }, (_evt, fname) => {
+			if (fname === '.credentials.json') setTimeout(report, 150); // debounce partial writes
+		});
+	} catch (e) { logError('cred watcher failed to start', { msg: e && e.message }); }
+	credWatcherReport = report;
+}
+let credWatcherReport = null;
 
 /**
  * Build claude argv for LONG-RUNNING mode (stream-json on stdin).
@@ -708,7 +774,8 @@ async function runPersistentClaude(envelope, relay, emit) {
 		// stale session lockfiles. Token may have rotated even when session
 		// args are the same, so always rewrite credentials before spawn.
 		wipeClaudeState();
-		configureCcAuth(envelope.ccToken);
+		configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+		startCredWatcher(envelope.callback);
 		const t_spawn_called = nowMs();
 		emit('phase', { name: 'pre_claude_spawn', ts: t_spawn_called });
 		spawnPersistentClaude(envelope);
@@ -726,10 +793,11 @@ async function runPersistentClaude(envelope, relay, emit) {
 		// in-memory token keeps working until then. Do NOT wipeClaudeState() here — the
 		// session lockfiles/caches are exactly the warmth we're keeping (that's the win).
 		if (claudeTokenHash !== newTokenHash) {
-			configureCcAuth(envelope.ccToken);
+			configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
 			claudeTokenHash = newTokenHash;
 			emit('phase', { name: 'claude_token_swapped', ts: nowMs() });
 		}
+		startCredWatcher(envelope.callback);
 		emit('phase', { name: 'claude_reused', ts: nowMs() });
 		activeTurn = {
 			relay, emit, t_spawn: nowMs(),
@@ -952,6 +1020,7 @@ const server = http.createServer(async (req, res) => {
 		// left pointing at the finished relay (done=true): a late F5 hitting
 		// /stream still gets the whole turn replayed from its buffer until the
 		// next /run replaces it. Never let teardown throw.
+		if (credWatcherReport) { try { await credWatcherReport(); } catch {} }
 		try {
 			const out = await relay.complete(relay.pendingResult || {});
 			if (out && out.ok === false) logError('save callback failed', { status: out.status, error: out.error });
