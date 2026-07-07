@@ -33,6 +33,14 @@ RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VE
 # (rclone REMOVED 2026-07-07 — server.js's R2 sync was dead code behind
 # `if (false && ...)`; the ~50 MB binary only bloated the image and slowed
 # Detona template imports/pulls. See git history to resurrect.)
+# Create the dir EXPLICITLY with the x bit. It used to be born 0755 as a side
+# effect of the first COPY being entrypoint.sh --chmod=0755; when that file was
+# removed (2026-07-07) the first COPY became contract.json --chmod=0644 and the
+# implicitly-created dir inherited 0644 — no x bit, so the non-root agent user
+# couldn't path-lookup INTO it: node died with "Cannot find module
+# /opt/smoothagent/server.js" on Detona's ext4 rootfs (Docker's overlay happened
+# to forgive it, which is why CI smoke passed — never trust implicit dir modes).
+RUN mkdir -p -m 0755 /opt/smoothagent
 COPY --chown=root:root --chmod=0644 contract.json /opt/smoothagent/contract.json
 COPY --chown=root:root --chmod=0755 server.js /opt/smoothagent/server.js
 # relay.js — required by server.js (per-turn retain/send/save transport). MUST be
