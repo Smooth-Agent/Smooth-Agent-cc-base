@@ -53,13 +53,22 @@ for i in $(seq 1 30); do
 done
 pass "server boots (default ENTRYPOINT) and /health responds"
 
-# ---- Test 1: first request pins the key + exec works ------------------------
+# ---- Test 0: pin the key via /stream (FIRST authed request), expect 204 -----
+# Order matters: the first non-/health request PINS the key, so it must be ours.
+# No turn has run yet → authed /stream = 204. (After a turn it 200-replays.)
 
-blue "==> Test 1: first request pins the key; mode=exec honors env"
+blue "==> Test 0: first request pins key; /stream with no turn → 204"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-API-Key: $KEY" "$URL/stream")
+[[ "$code" == "204" ]] || fail "expected 204 on authed /stream before any turn, got $code"
+pass "key pinned; /stream (no turn) → 204"
+
+# ---- Test 1: exec works with the pinned key ---------------------------------
+
+blue "==> Test 1: mode=exec honors env"
 out=$(run '{"mode":"exec","cmd":["sh","-c","echo $GREETING"],"env":{"GREETING":"ola-smoke"}}')
 echo "$out" | grep -q '"type":"ready"' || fail "expected ready event, got: $out"
 echo "$out" | grep -q 'ola-smoke'      || fail "expected env echo, got: $out"
-pass "exec via POST /run (key pinned on first use)"
+pass "exec via POST /run with pinned key"
 
 # ---- Test 2: wrong key → 401 -------------------------------------------------
 
@@ -83,9 +92,10 @@ pass "no key → 401"
 blue "==> Test 4: /stream requires the key"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/stream")
 [[ "$code" == "401" ]] || fail "expected 401 on unauthenticated /stream, got $code"
+# authed /stream after a turn 200-replays the retained relay — both fine here.
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-API-Key: $KEY" "$URL/stream")
-[[ "$code" == "204" ]] || fail "expected 204 on authed /stream (no active turn), got $code"
-pass "/stream: 401 without key, 204 with key"
+[[ "$code" == "200" || "$code" == "204" ]] || fail "expected 200/204 on authed /stream, got $code"
+pass "/stream: 401 without key, authed ok"
 
 # ---- Test 5: malformed JSON ---------------------------------------------------
 
