@@ -717,7 +717,32 @@ const server = http.createServer(async (req, res) => {
 		const t_run_received = nowMs();
 		emit('phase', { name: 'run_received', ts: t_run_received });
 
-		if (mode === 'cc-cli') {
+		if (mode === 'cc-cli' && envelope.warmupOnly === true) {
+			// WARMUP-ONLY (inline fork, 2026-07-07): boot claude — wipe stale sessions,
+			// write the FULL cred pair, spawn, start the cred watcher — but send NO user
+			// message. The Worker forks this box into the golden right after, so the
+			// snapshot carries a booted+authed claude with a CLEAN session (no phantom
+			// 'ok' — the old bake's warmup message leaked into every clone's history).
+			// Liveness proof without inference: a set_model control ping to the SAME
+			// model (no-op) — the ack proves the CLI is up and serving its stdin
+			// protocol. Auth itself is exercised on first real inference (measured
+			// ~52ms — the entire thing the 'ok' used to pre-pay).
+			if (!envelope.ccToken) throw new Error('ccToken required for warmupOnly');
+			if (!claudeProc || claudeProc.exitCode !== null || claudeSig !== coreSignature(envelope)) {
+				if (claudeProc) await killClaude('warmup_respawn');
+				wipeClaudeState();
+				configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+				startCredWatcher(envelope.callback);
+				emit('phase', { name: 'pre_claude_spawn', ts: nowMs() });
+				spawnPersistentClaude(envelope);
+				claudeSig = coreSignature(envelope);
+				claudeModel = envelope.model || null;
+				claudeTokenHash = tokenHash(envelope.ccToken);
+			}
+			const alive = await trySetModel(envelope.model || claudeModel || 'claude-opus-4-8', 15_000);
+			emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: alive });
+			if (!alive) emit('error', { code: 'warmup_no_ack', message: 'claude did not ack the control ping', retryable: true });
+		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 
