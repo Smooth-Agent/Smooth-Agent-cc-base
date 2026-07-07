@@ -72,247 +72,9 @@ let activeTurn = null;
 let stdoutLineBuffer = '';
 /** Time of last /run completion (for the idle-exit watchdog). */
 let lastRunAt = Date.now();
-/**
- * Fingerprint of the workspace files synced into THIS container. A warm container
- * already holds the workspace locally, so we only re-sync from R2 when this is a
- * fresh container (null) or the fingerprint changed (a new/removed upload). null
- * until the first successful sync, so a cold container always syncs.
- */
-let lastSyncedFingerprint = null;
-
 // ---------------------------------------------------------------------------
-// Workspace proxy sync.
-//
-// Container talks to the Worker (`workspaceProxy.url`) using a short-lived
-// JWT (`workspaceProxy.jwt`) — NEVER directly to R2. The Worker enforces
-// that every op is rooted at workspaces/<jwt.chatId>/, so cross-tenant
-// leaks are impossible by construction even if claude is jailbroken and
-// extracts the JWT (it would only get access to its own chat).
-//
-// We use Node 22 built-in fetch — no S3 client, no rclone, no long-lived
-// credentials. The JWT is the ONLY thing in container memory that touches
-// R2, and it's chat-scoped + 10-min expiring.
-// ---------------------------------------------------------------------------
-
-const SYNC_CONCURRENCY = 8;
-
-// Excluded path patterns. Apply both ways so node_modules / .git / claude
-// internals never traverse R2 even if a stale upload sneaks through.
-//
-// HOME dotfiles (.bashrc, .profile, etc) appear at the workspace root because
-// HOME=/workspace for the agent user. They're useradd defaults — not user
-// content — so they should never appear in R2. .npmrc / .ssh / .gnupg get
-// special exclusion because they may contain credentials.
-const HOME_DOTFILES = new Set([
-	'.bashrc',
-	'.bash_logout',
-	'.bash_history',
-	'.bash_profile',
-	'.profile',
-	'.npmrc',
-	'.viminfo',
-	'.lesshst',
-	'.wget-hsts',
-]);
-
-function shouldExclude(rel) {
-	if (rel.startsWith('node_modules/') || rel.includes('/node_modules/')) return true;
-	if (rel.startsWith('.claude/') || rel.startsWith('.claude.json')) return true;
-	if (rel.startsWith('.git/') || rel.includes('/.git/')) return true;
-	if (rel.startsWith('.ssh/') || rel.startsWith('.gnupg/')) return true;
-	if (rel.endsWith('.log')) return true;
-	if (rel.startsWith('.cache/') || rel.includes('/.cache/')) return true;
-	// HOME dotfiles only at the workspace ROOT (no slash before name).
-	// Subpaths like myproject/.bashrc are user content and should sync.
-	if (!rel.includes('/') && HOME_DOTFILES.has(rel)) return true;
-	return false;
-}
-
-async function proxyFetch(proxy, urlPath, init = {}) {
-	const headers = { ...(init.headers || {}), Authorization: `Bearer ${proxy.jwt}` };
-	return fetch(`${proxy.url}${urlPath}`, { ...init, headers });
-}
-
-async function listWorkspace(proxy) {
-	const res = await proxyFetch(proxy, '/internal/workspace/list');
-	if (!res.ok) {
-		const txt = await res.text().catch(() => '');
-		throw new Error(`list ${res.status}: ${txt.slice(0, 200)}`);
-	}
-	const data = await res.json();
-	return Array.isArray(data?.files) ? data.files : [];
-}
-
-async function getFile(proxy, rel) {
-	const res = await proxyFetch(proxy, `/internal/workspace/get?path=${encodeURIComponent(rel)}`);
-	if (res.status === 404) return null;
-	if (!res.ok) throw new Error(`get ${rel} ${res.status}`);
-	const buf = await res.arrayBuffer();
-	return Buffer.from(buf);
-}
-
-async function putFile(proxy, rel, buffer) {
-	const res = await proxyFetch(proxy, `/internal/workspace/put?path=${encodeURIComponent(rel)}`, {
-		method: 'PUT',
-		headers: {
-			'Content-Type': 'application/octet-stream',
-			'Content-Length': String(buffer.length),
-		},
-		body: buffer,
-	});
-	if (!res.ok) {
-		const txt = await res.text().catch(() => '');
-		throw new Error(`put ${rel} ${res.status}: ${txt.slice(0, 200)}`);
-	}
-}
-
-async function deleteFile(proxy, rel) {
-	const res = await proxyFetch(proxy, `/internal/workspace/delete?path=${encodeURIComponent(rel)}`, {
-		method: 'DELETE',
-	});
-	if (!res.ok && res.status !== 404) {
-		throw new Error(`delete ${rel} ${res.status}`);
-	}
-}
-
-// Walk a local directory into a flat list of relative paths (with excludes).
-async function walkLocal(workspaceDir) {
-	const out = [];
-	async function rec(dir, base) {
-		let entries;
-		try {
-			entries = await fs.promises.readdir(dir, { withFileTypes: true });
-		} catch (err) {
-			if (err && err.code === 'ENOENT') return;
-			throw err;
-		}
-		for (const e of entries) {
-			const full = path.join(dir, e.name);
-			const rel = base ? `${base}/${e.name}` : e.name;
-			if (e.isSymbolicLink()) continue;
-			if (e.isDirectory()) {
-				if (shouldExclude(rel + '/')) continue;
-				await rec(full, rel);
-			} else if (e.isFile()) {
-				if (shouldExclude(rel)) continue;
-				out.push(rel);
-			}
-		}
-	}
-	await rec(workspaceDir, '');
-	return out;
-}
-
-// Bounded-concurrency pool. Returns {results, errors}.
-async function pool(items, fn, concurrency) {
-	const out = new Array(items.length);
-	let next = 0;
-	let errors = 0;
-	async function worker() {
-		while (next < items.length) {
-			const i = next++;
-			try {
-				out[i] = await fn(items[i], i);
-			} catch (err) {
-				errors++;
-				out[i] = { __error: err && err.message ? err.message : String(err) };
-			}
-		}
-	}
-	const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
-	await Promise.all(workers);
-	return { results: out, errors };
-}
-
-/**
- * Sync R2 → /workspace via the Worker proxy. Called BEFORE claude spawn.
- * First turn returns empty manifest from the proxy, so this is near-noop.
- */
-async function syncFromWorker(proxy, workspaceDir) {
-	if (!proxy?.url || !proxy?.jwt) return { skipped: true, reason: 'no_proxy' };
-
-	fs.mkdirSync(workspaceDir, { recursive: true });
-	const t0 = nowMs();
-
-	let files;
-	try {
-		files = await listWorkspace(proxy);
-	} catch (err) {
-		return { ok: false, ms: nowMs() - t0, error: err.message };
-	}
-	// Defensive client-side excludes too — in case the bucket has historical
-	// junk that pre-dates the current excludes list.
-	files = files.filter((f) => !shouldExclude(f.key));
-
-	if (files.length === 0) {
-		return { ok: true, ms: nowMs() - t0, count: 0 };
-	}
-
-	const { errors } = await pool(
-		files,
-		async (f) => {
-			const buf = await getFile(proxy, f.key);
-			if (!buf) return { skipped: true };
-			const dest = path.join(workspaceDir, f.key);
-			fs.mkdirSync(path.dirname(dest), { recursive: true });
-			await fs.promises.writeFile(dest, buf);
-			return { wrote: f.key, bytes: buf.length };
-		},
-		SYNC_CONCURRENCY,
-	);
-
-	return { ok: errors === 0, ms: nowMs() - t0, count: files.length, errors };
-}
-
-/**
- * Sync /workspace → R2 via the Worker proxy. Called AFTER claude exits.
- *
- * Behaves like `rclone sync` (mirror): uploads every local file and deletes
- * remote files that no longer exist locally. Failures are logged but never
- * mask claude's own exit/result event.
- */
-async function syncToWorker(proxy, workspaceDir) {
-	if (!proxy?.url || !proxy?.jwt) return { skipped: true, reason: 'no_proxy' };
-	if (!fs.existsSync(workspaceDir)) return { skipped: true, reason: 'no_workspace_dir' };
-
-	const t0 = nowMs();
-
-	const [localList, remoteList] = await Promise.all([
-		walkLocal(workspaceDir),
-		listWorkspace(proxy).catch(() => []),
-	]);
-	const localSet = new Set(localList);
-	const remoteRels = remoteList.map((f) => f.key).filter((k) => !shouldExclude(k));
-
-	const upload = await pool(
-		localList,
-		async (rel) => {
-			const full = path.join(workspaceDir, rel);
-			const buf = await fs.promises.readFile(full);
-			await putFile(proxy, rel, buf);
-			return { rel, bytes: buf.length };
-		},
-		SYNC_CONCURRENCY,
-	);
-
-	const toDelete = remoteRels.filter((rel) => !localSet.has(rel));
-	let deleteErrors = 0;
-	if (toDelete.length) {
-		const del = await pool(toDelete, async (rel) => {
-			await deleteFile(proxy, rel);
-			return { rel };
-		}, SYNC_CONCURRENCY);
-		deleteErrors = del.errors;
-	}
-
-	return {
-		ok: upload.errors === 0 && deleteErrors === 0,
-		ms: nowMs() - t0,
-		uploaded: localList.length,
-		deleted: toDelete.length,
-		errors: upload.errors + deleteErrors,
-	};
-}
+// R2 workspace sync subsystem REMOVED 2026-07-07 (was ~220 dead lines behind
+// `if (false && proxy)` — see git history). rclone left the image with it.
 
 function nowMs() {
 	return Date.now();
@@ -486,19 +248,9 @@ function buildClaudeArgs(envelope) {
 	return args;
 }
 
-/**
- * Signature of the args that materially change Claude's behavior. If a
- * subsequent /run has a different signature, the persistent process must be
- * restarted (it's already locked into the prior model/system-prompt/MCPs).
- */
-function sessionSignature(envelope) {
-	return JSON.stringify({
-		model: envelope.model || null,
-		systemPrompt: envelope.systemPrompt || null,
-		maxTurns: envelope.maxTurns || null,
-		mcpConfig: envelope.mcpConfig || null,
-	});
-}
+// (sessionSignature — the model-inclusive variant — was removed 2026-07-07: it was
+// orphaned once the in-flight set_model switch made coreSignature the only reuse
+// identity. One source of truth for "what is process identity": coreSignature.)
 
 /**
  * Signature WITHOUT the model. The model is a per-REQUEST parameter to the
@@ -827,10 +579,45 @@ async function runPersistentClaude(envelope, relay, emit) {
 	});
 }
 
+// ---------------------------------------------------------------------------
+// AUTH — trust-on-first-use key pinning (2026-07-07 audit: /run had NO auth at
+// all; anything with network reach could run claude with bypassPermissions).
+//
+// The image is generic and boots with no secrets, so there is nothing baked to
+// compare against. But the FIRST request a box ever receives is by construction
+// the creator's (Detona delivers the worker's run.http at spawn, before the port
+// is reachable by anyone else), so we PIN that request's X-API-Key and demand it
+// forever after. Golden bakes pin the worker's key too, so clones inherit the pin
+// through the RAM snapshot. If the worker's key ever rotates, old boxes 401 and
+// the worker's transport retry destroys + respawns them — self-healing.
+//
+// An empty first key pins '' (auth effectively open) — loudly logged so a
+// misconfigured DETONA_CC_KEY is visible instead of silently unprotected.
+let pinnedApiKey = null; // null = nothing pinned yet; '' = pinned open
+function checkApiKey(req) {
+	const got = String(req.headers['x-api-key'] ?? '');
+	if (pinnedApiKey === null) {
+		pinnedApiKey = got;
+		if (!got) logError('auth pin EMPTY — first request had no x-api-key, auth is OPEN');
+		else logInfo('auth pinned', { keyHash: tokenHash(got) });
+		return true;
+	}
+	const a = Buffer.from(got), b = Buffer.from(pinnedApiKey);
+	return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && req.url === '/health') {
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ status: 'ok', inFlight }));
+		return;
+	}
+
+	// Everything besides /health requires the pinned key (both /run and /stream —
+	// /stream replays the full turn, it is as sensitive as running one).
+	if (!checkApiKey(req)) {
+		res.writeHead(401, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ error: 'unauthorized' }));
 		return;
 	}
 
@@ -912,15 +699,6 @@ const server = http.createServer(async (req, res) => {
 	emit('ready', { mode, cwd: process.cwd() });
 
 	// Dispatch.
-	const workspaceDir = process.env.RUN_CWD || '/workspace';
-	// Workspace proxy: container talks to the Worker (not R2). Worker scopes
-	// every op to this chat's prefix using the chatId baked into the JWT,
-	// so even if the JWT is exfiltrated by a jailbroken claude it can only
-	// access this chat's files. No S3 token exists in this process.
-	const proxy = envelope.workspaceProxy && envelope.workspaceProxy.url && envelope.workspaceProxy.jwt
-		? envelope.workspaceProxy
-		: null;
-
 	try {
 		// Phase timestamps emitted as events for the worker-side benchmark
 		// instrumentation. These are inner-container measurements that the
@@ -932,61 +710,19 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
 
-			// 1. Pull last-turn workspace from R2 via Worker.
-			// ── SYNC DISABLED (decisão temporária) ────────────────────────────
-			// R2 workspace sync is OFF for now. CC chat carries context via D1
-			// priorContext, not files, so the sync was pure latency. To re-enable,
-			// change `false && proxy` back to `proxy` here AND in the sync_up below.
-			// (The skip-when-warm logic + wsFingerprint stay wired for when it's on.)
-			if (false && proxy) {
-				const wsFp = envelope.wsFingerprint || '';
-				if (lastSyncedFingerprint === wsFp) {
-					emit('sync_down_done', { ok: true, ms: 0, skipped: 'warm_unchanged' });
-				} else {
-					emit('sync_down_start', {});
-					const downResult = await syncFromWorker(proxy, workspaceDir);
-					if (downResult.ok === false) {
-						logError('sync_down failed', { error: downResult.error, errors: downResult.errors });
-						emit('sync_down_done', { ok: false, ms: downResult.ms, error: downResult.error });
-						// Don't fail the turn — claude can still run with empty workspace.
-					} else {
-						lastSyncedFingerprint = wsFp;
-						emit('sync_down_done', { ok: true, ms: downResult.ms, count: downResult.count });
-					}
-				}
-			}
+			// R2 workspace sync REMOVED (2026-07-07). It was disabled behind
+			// `if (false && ...)` since the D1-priorContext model made it pure
+			// latency, and the dead subsystem (~200 lines + rclone in the image)
+			// only invited drift. If file sync ever returns, rebuild it against
+			// the workspace-proxy JWT model (see git history for the old code).
 
-			// 2. Run claude. runPersistentClaude reuses the same process across
+			// Run claude. runPersistentClaude reuses the same process across
 			//    turns when args + token match — only the first turn pays the
 			//    ~20-25s OAuth handshake cost. Subsequent turns are ~2-3s.
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
-
-			// 4. Push workspace back to R2 via Worker so the next turn sees it.
-			// ── SYNC DISABLED (decisão temporária) — pair of the sync_down above.
-			//    Re-enable by changing `false && proxy` back to `proxy`.
-			if (false && proxy) {
-				emit('sync_up_start', {});
-				try {
-					const upResult = await syncToWorker(proxy, workspaceDir);
-					if (upResult.ok === false) {
-						logError('sync_up failed', { errors: upResult.errors });
-						emit('sync_up_done', { ok: false, ms: upResult.ms, errors: upResult.errors });
-					} else {
-						emit('sync_up_done', {
-							ok: true,
-							ms: upResult.ms,
-							uploaded: upResult.uploaded,
-							deleted: upResult.deleted,
-						});
-					}
-				} catch (err) {
-					logError('sync_up threw', { msg: err && err.message });
-					emit('sync_up_done', { ok: false, error: 'exception' });
-				}
-			}
 		} else if (mode === 'build' || mode === 'exec') {
 			if (!Array.isArray(envelope.cmd) || envelope.cmd.length === 0) {
 				throw new Error(`cmd required for mode=${mode}`);
