@@ -580,42 +580,46 @@ async function runPersistentClaude(envelope, relay, emit) {
 }
 
 // ---------------------------------------------------------------------------
-// AUTH — trust-on-first-use key pinning (2026-07-07 audit: /run had NO auth at
+// AUTH — trust-on-first-RUN key pinning (2026-07-07 audit: /run had NO auth at
 // all; anything with network reach could run claude with bypassPermissions).
 //
 // The image is generic and boots with no secrets, so there is nothing baked to
-// compare against. But the FIRST request a box ever receives is by construction
-// the creator's (Detona delivers the worker's run.http at spawn, before the port
-// is reachable by anyone else), so we PIN that request's X-API-Key and demand it
-// forever after. Golden bakes pin the worker's key too, so clones inherit the pin
-// through the RAM snapshot. If the worker's key ever rotates, old boxes 401 and
-// the worker's transport retry destroys + respawns them — self-healing.
+// compare against. The pin therefore comes from the first POST /run — which is
+// by construction the CREATOR's (Detona delivers the worker's run.http at spawn)
+// — and is demanded (timing-safe) on every mutating/sensitive request after.
+// Golden bakes pin the worker's key, so clones inherit the pin via the snapshot.
+// If the worker's key rotates, old boxes 401 and the worker's transport retry
+// destroys + respawns them — self-healing.
 //
-// An empty first key pins '' (auth effectively open) — loudly logged so a
+// Why pin ONLY on POST /run (not any-first-request): Detona's template build
+// boots the VM and its readiness probe GETs the port BEFORE any worker request
+// exists. Pinning on that probe would pin EMPTY into the template snapshot —
+// auth permanently open — and 401-ing it breaks the build (AGENT_READY timeout,
+// observed live on import). GETs are safe pre-pin: /health is static, /stream
+// has nothing to replay before the first run.
+//
+// An empty first-run key pins '' (auth effectively open) — loudly logged so a
 // misconfigured DETONA_CC_KEY is visible instead of silently unprotected.
 let pinnedApiKey = null; // null = nothing pinned yet; '' = pinned open
-function checkApiKey(req) {
+function apiKeyMatches(req) {
 	const got = String(req.headers['x-api-key'] ?? '');
-	if (pinnedApiKey === null) {
-		pinnedApiKey = got;
-		if (!got) logError('auth pin EMPTY — first request had no x-api-key, auth is OPEN');
-		else logInfo('auth pinned', { keyHash: tokenHash(got) });
-		return true;
-	}
 	const a = Buffer.from(got), b = Buffer.from(pinnedApiKey);
 	return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 const server = http.createServer(async (req, res) => {
-	if (req.method === 'GET' && req.url === '/health') {
+	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
+		// Open on purpose: static liveness for Detona's build/readiness probes.
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ status: 'ok', inFlight }));
 		return;
 	}
 
-	// Everything besides /health requires the pinned key (both /run and /stream —
-	// /stream replays the full turn, it is as sensitive as running one).
-	if (!checkApiKey(req)) {
+	// Past this point everything is sensitive (/run runs claude, /stream replays
+	// the whole turn). Once a key is pinned, demand it. Before any pin exists the
+	// box has nothing to protect (no turn ever ran) — /stream 204s below and
+	// POST /run performs the pinning.
+	if (pinnedApiKey !== null && !apiKeyMatches(req)) {
 		res.writeHead(401, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ error: 'unauthorized' }));
 		return;
@@ -639,6 +643,13 @@ const server = http.createServer(async (req, res) => {
 		res.writeHead(404, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ error: 'not_found' }));
 		return;
+	}
+
+	// First /run ever = the creator's (worker run.http at spawn) → PIN its key.
+	if (pinnedApiKey === null) {
+		pinnedApiKey = String(req.headers['x-api-key'] ?? '');
+		if (!pinnedApiKey) logError('auth pin EMPTY — first /run had no x-api-key, auth is OPEN');
+		else logInfo('auth pinned', { keyHash: tokenHash(pinnedApiKey) });
 	}
 
 	if (inFlight) {

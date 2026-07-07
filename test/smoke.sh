@@ -53,18 +53,20 @@ for i in $(seq 1 30); do
 done
 pass "server boots (default ENTRYPOINT) and /health responds"
 
-# ---- Test 0: pin the key via /stream (FIRST authed request), expect 204 -----
-# Order matters: the first non-/health request PINS the key, so it must be ours.
-# No turn has run yet → authed /stream = 204. (After a turn it 200-replays.)
+# ---- Test 0: pre-pin surface (Detona probe compatibility) --------------------
+# Before the first POST /run, no key is pinned: GET / and /health answer openly
+# (Detona's build readiness probe), and /stream 204s (nothing to protect yet).
 
-blue "==> Test 0: first request pins key; /stream with no turn → 204"
-code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-API-Key: $KEY" "$URL/stream")
-[[ "$code" == "204" ]] || fail "expected 204 on authed /stream before any turn, got $code"
-pass "key pinned; /stream (no turn) → 204"
+blue "==> Test 0: pre-pin — GET / open (probe), /stream 204"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/")
+[[ "$code" == "200" ]] || fail "expected 200 on GET / (probe path), got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/stream")
+[[ "$code" == "204" ]] || fail "expected 204 on pre-pin /stream (no turn), got $code"
+pass "pre-pin: GET / 200, /stream 204"
 
-# ---- Test 1: exec works with the pinned key ---------------------------------
+# ---- Test 1: first POST /run pins the key + exec works -----------------------
 
-blue "==> Test 1: mode=exec honors env"
+blue "==> Test 1: first /run pins the key; mode=exec honors env"
 out=$(run '{"mode":"exec","cmd":["sh","-c","echo $GREETING"],"env":{"GREETING":"ola-smoke"}}')
 echo "$out" | grep -q '"type":"ready"' || fail "expected ready event, got: $out"
 echo "$out" | grep -q 'ola-smoke'      || fail "expected env echo, got: $out"
