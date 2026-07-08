@@ -558,11 +558,25 @@ async function runPersistentClaude(envelope, relay, emit) {
 		};
 	}
 
+	// CONTEXT REFOLD AUTOMATION (owner design, 2026-07-07): the box, not the Worker,
+	// knows the TRUTH about cold-vs-warm. On a Detona REBASE (base image changed →
+	// instance re-inits cold, volume kept) the Worker still sees "resume" (its marker
+	// exists) and skips the context fold — a fresh claude would answer with amnesia.
+	// So: whenever WE had to spawn a fresh claude (needsRespawn) and the envelope
+	// carries the chat's priorContext, fold it into the prompt HERE. The sentinel
+	// check makes it idempotent (the Worker pre-folds on clone/base-cold paths — do
+	// not fold twice). Warm reuse skips: claude remembers natively.
+	let promptContent = envelope.prompt;
+	if (needsRespawn && envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
+		promptContent = `${envelope.priorContext}\n\n## Mensagem atual do usuário\n\n${promptContent}`;
+		emit('phase', { name: 'context_refolded', ts: nowMs(), chars: envelope.priorContext.length });
+	}
+
 	// Send the user message via stdin as an NDJSON event. stream-json input
 	// format expects {"type":"user","message":{"role":"user","content":"..."}}.
 	const userEvent = {
 		type: 'user',
-		message: { role: 'user', content: envelope.prompt },
+		message: { role: 'user', content: promptContent },
 	};
 	try {
 		claudeProc.stdin.write(JSON.stringify(userEvent) + '\n');
