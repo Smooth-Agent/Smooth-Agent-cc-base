@@ -185,25 +185,42 @@ let credWatcherStarted = false;
  * Worker also re-forks the golden with the new key, in parallel, on its side.
  * fs.watch + a post-turn sweep (belt and suspenders; fs.watch can miss on
  * overlayfs). Token contents never logged.
+ *
+ * SNAPSHOT TRAP (2026-07-10, the "Not logged in" death): credWatcherStarted
+ * and the report closure are process state — a golden fork restores them
+ * FROZEN with the bake-time callback jwt. Every report from a forked box then
+ * 401'd at the Worker (silently) and claude's rotation EVAPORATED from the
+ * source while the old refresh token was already burned → the next chat
+ * cloned a dead pair. Fix: the callback is REBOUND on every /run into
+ * credWatcherCallback (module-level), and the report always reads the CURRENT
+ * turn's jwt from there. Never capture callback params in this closure.
  */
+let credWatcherCallback = null;
 function startCredWatcher(callback) {
-	if (credWatcherStarted || !callback || !callback.url) return;
+	if (callback && callback.url) credWatcherCallback = callback; // rebind EVERY turn — see snapshot trap above
+	if (credWatcherStarted || !credWatcherCallback) return;
 	credWatcherStarted = true;
 	const report = async () => {
 		try {
+			const cb = credWatcherCallback;
+			if (!cb || !cb.url) return;
 			const fp = credFileFingerprint();
 			if (!fp || fp === credFileLastReported) return;
 			const cred = JSON.parse(fs.readFileSync(CRED_FILE_PATH(), 'utf8')).claudeAiOauth || {};
 			if (!cred.accessToken) return;
 			credFileLastReported = fp;
-			const url = callback.url.replace(/\/internal\/chat-result$/, '/internal/cc-credentials');
+			const url = cb.url.replace(/\/internal\/chat-result$/, '/internal/cc-credentials');
 			const r = await fetch(url, {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json', ...(callback.jwt ? { Authorization: `Bearer ${callback.jwt}` } : {}) },
+				headers: { 'Content-Type': 'application/json', ...(cb.jwt ? { Authorization: `Bearer ${cb.jwt}` } : {}) },
 				body: JSON.stringify({ credentials: { accessToken: cred.accessToken, refreshToken: cred.refreshToken || null, expiresAt: cred.expiresAt || null } }),
 			});
+			// A failed report must NOT be marked as reported — the post-turn sweep
+			// (next turn, fresh jwt) retries it. Losing a rotation kills the pair.
+			if (!r.ok) credFileLastReported = null;
 			logInfo('cred rotation reported', { status: r.status });
 		} catch (e) {
+			credFileLastReported = null; // retry on the next sweep
 			logError('cred report failed', { msg: e && e.message });
 		}
 	};
