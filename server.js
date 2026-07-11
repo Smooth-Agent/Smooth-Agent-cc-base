@@ -638,6 +638,112 @@ function apiKeyMatches(req) {
 	return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// ─── SLOT RUNTIME (SLOT_CONTRACT.md, Fase 1 2026-07-11) ─────────────────────
+// The client's agent server: a PERSISTENT process speaking GET /ready +
+// POST /agent-run on localhost. Managed exactly like claude: spawned once,
+// kept across turns, captured in the golden snapshot — ONE photo holds
+// adapter + client SDK (the "um cold só"). slot {cmd, port} arrives in the
+// envelope but is agent-level PRE-CONFIGURATION upstream; the envelope comes
+// from our Worker (pinned x-api-key), same trust as build/exec cmd.
+// SNAPSHOT RULE (the credWatcher lesson): nothing per-turn lives here —
+// slotProc/slotKey only hold the process identity, which the photo SHOULD
+// carry. Per-turn data (prompt, secrets, context) rides each /agent-run body.
+let slotProc = null;
+let slotKey = null; // cmd|port the running process was started with
+
+function slotFetch(port, path, opts, inactivityMs) {
+	return new Promise((resolve, reject) => {
+		const r = http.request(
+			{ host: '127.0.0.1', port, path, method: (opts && opts.method) || 'GET', headers: (opts && opts.headers) || {} },
+			resolve,
+		);
+		r.on('error', reject);
+		// Inactivity timeout (socket idle), NOT a total cap — a slow SDK streaming
+		// tokens keeps the socket busy and lives; a dead one gets reaped.
+		r.setTimeout(inactivityMs || 5_000, () => r.destroy(new Error('slot inactivity timeout')));
+		if (opts && opts.body) r.write(opts.body);
+		r.end();
+	});
+}
+
+/** Spawn the slot process if missing/dead/config-changed, then poll /ready. */
+async function ensureSlotReady(slot, emit, bootTimeoutMs) {
+	const key = `${slot.cmd}|${slot.port}`;
+	if (!slotProc || slotProc.exitCode !== null || slotKey !== key) {
+		if (slotProc && slotProc.exitCode === null) { try { slotProc.kill('SIGTERM'); } catch { /* already gone */ } }
+		emit('phase', { name: 'slot_spawn', ts: nowMs() });
+		slotProc = spawn('/bin/sh', ['-c', slot.cmd], {
+			cwd: process.env.RUN_CWD || '/workspace',
+			env: { ...process.env, SLOT_PORT: String(slot.port) },
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+		slotProc.stdout.on('data', (d) => logInfo('slot stdout', { line: String(d).slice(0, 200) }));
+		slotProc.stderr.on('data', (d) => logError('slot stderr', { line: String(d).slice(0, 200) }));
+		slotKey = key;
+	}
+	const deadline = nowMs() + (bootTimeoutMs || 60_000);
+	let lastErr = 'not_attempted';
+	while (nowMs() < deadline) {
+		try {
+			const r = await slotFetch(slot.port, '/ready', {}, 2_000);
+			if (r.statusCode === 200) {
+				let body = '';
+				for await (const c of r) body += c;
+				return { ok: true, ready: body.slice(0, 200) };
+			}
+			lastErr = `http_${r.statusCode}`;
+			r.resume(); // drain
+		} catch (e) { lastErr = e && e.message ? e.message : 'x'; }
+		await new Promise((rs) => setTimeout(rs, 150));
+	}
+	return { ok: false, ready: null, err: lastErr };
+}
+
+/** One turn against the slot: POST /agent-run, relay its NDJSON stream. */
+async function runSlotTurn(envelope, relay, emit) {
+	const slot = envelope.slot;
+	const up = await ensureSlotReady(slot, emit, 60_000);
+	emit('phase', { name: 'slot_ready', ts: nowMs(), ack: up.ok, info: up.ready || up.err });
+	if (!up.ok) { emit('error', { code: 'slot_not_ready', message: String(up.err), retryable: true }); return; }
+	const body = JSON.stringify({
+		prompt: envelope.prompt || '',
+		context: envelope.priorContext || '',
+		secrets: envelope.secrets || {},
+		sessionId: envelope.sessionId || envelope.chatId || null,
+		meta: { chatId: envelope.chatId || null, promptId: envelope.promptId || null },
+	});
+	const resp = await slotFetch(slot.port, '/agent-run', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+		body,
+	}, 300_000);
+	emit('phase', { name: 'slot_run_started', ts: nowMs() });
+	let buf = '';
+	let sawFirst = false;
+	for await (const chunk of resp) {
+		buf += chunk;
+		let i;
+		while ((i = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, i).trim();
+			buf = buf.slice(i + 1);
+			if (!line) continue;
+			if (!sawFirst) { sawFirst = true; emit('phase', { name: 'slot_first_byte', ts: nowMs() }); }
+			let ev = null;
+			try { ev = JSON.parse(line); } catch { continue; } // contract: NDJSON only
+			if (ev.type === 'text') {
+				emit('text', { text: String(ev.data ?? '') });
+			} else if (ev.type === 'result') {
+				const d = ev.data || {};
+				// pendingResult feeds relay.complete's Worker callback (persistence).
+				relay.pendingResult = { text: d.text || '', usage: d.usage || null, sessionId: envelope.sessionId || null, context: typeof d.context === 'string' ? d.context : null };
+				emit('result', { text: d.text || '', usage: d.usage || null, context: typeof d.context === 'string' ? d.context : null });
+			} else if (ev.type === 'error') {
+				emit('error', { code: 'slot_error', message: String((ev.data && ev.data.message) || 'slot error'), retryable: false });
+			}
+		}
+	}
+}
+
 const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// Open on purpose: static liveness for Detona's build/readiness probes.
@@ -790,6 +896,19 @@ const server = http.createServer(async (req, res) => {
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
+		} else if (mode === 'slot' && envelope.warmupOnly === true) {
+			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
+			// forks this box right after, so the snapshot carries adapter + client
+			// SDK already booted ("um cold só"). Mirror of the cc-cli warmup.
+			if (!envelope.slot || !envelope.slot.cmd || !envelope.slot.port) throw new Error('slot {cmd, port} required for mode=slot');
+			const up = await ensureSlotReady(envelope.slot, emit, 60_000);
+			emit('phase', { name: 'slot_warmup_ready', ts: nowMs(), ack: up.ok, info: up.ready || up.err });
+			if (!up.ok) emit('error', { code: 'warmup_no_ack', message: 'slot did not become ready', retryable: true });
+		} else if (mode === 'slot') {
+			if (!envelope.slot || !envelope.slot.cmd || !envelope.slot.port) throw new Error('slot {cmd, port} required for mode=slot');
+			if (!envelope.prompt) throw new Error('prompt required for mode=slot');
+			await runSlotTurn(envelope, relay, emit);
+			emit('phase', { name: 'post_slot_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'build' || mode === 'exec') {
 			if (!Array.isArray(envelope.cmd) || envelope.cmd.length === 0) {
 				throw new Error(`cmd required for mode=${mode}`);
