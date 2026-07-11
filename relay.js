@@ -77,6 +77,10 @@ class TurnRelay {
           promptId: this.promptId,
           text: (result && result.text) || '',
           usage: (result && result.usage) || null,
+          // SLOT runtime (SLOT_CONTRACT.md): the slot's opaque conversation
+          // state — the Worker persists it (chats.slot_context) and returns it
+          // as `context` on the next turn. Absent for cc-cli turns.
+          ...(result && typeof result.context === 'string' ? { context: result.context } : {}),
         }),
       });
       return { ok: r.ok, status: r.status, saved: true };
