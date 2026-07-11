@@ -65,6 +65,14 @@ class TurnRelay {
     for (const res of this.sinks) { try { res.end(); } catch { /* closed */ } }
     this.sinks = [];
     if (!this.callback) return { ok: true, saved: false };
+    // EMPTY-CLAIM GUARD (2026-07-11): a run with NOTHING to persist (no text,
+    // no usage) must NOT fire the completion callback — the warmupOnly run of
+    // the inline fork inherits the TURN's callback jwt, and its empty POST was
+    // CLAIMING the prompt row ('done', response '') before the real turn's
+    // result could land. The callback exists to persist an answer; no answer,
+    // no call. (Cred rotation capture is unaffected — the watcher has its own
+    // dedicated endpoint.)
+    if (!result || (!result.text && !result.usage)) return { ok: true, saved: false };
     try {
       const r = await fetch(this.callback.url, {
         method: 'POST',
