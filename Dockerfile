@@ -30,6 +30,14 @@ ARG CC_VERSION=latest
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VERSION}" \
  && npm cache clean --force
 
+# Codex CLI — the SECOND ENGINE (2026-07-18). Same box, same adapter machinery
+# (server.js runCodexTurn translates codex JSONL → claude stream-json), different
+# brain. Engines are OUR primitive and ship baked in the base; Detona layers stay
+# the CLIENT's primitive for their own customization.
+ARG CODEX_VERSION=latest
+RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
+ && npm cache clean --force
+
 # (rclone REMOVED 2026-07-07 — server.js's R2 sync was dead code behind
 # `if (false && ...)`; the ~50 MB binary only bloated the image and slowed
 # Detona template imports/pulls. See git history to resurrect.)

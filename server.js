@@ -294,6 +294,9 @@ function buildClaudeArgs(envelope) {
  */
 function coreSignature(envelope) {
 	return JSON.stringify({
+		// engine is part of process identity (defensive: a claude proc must never
+		// be "reused" by a codex turn or vice-versa — runCodexTurn also kills).
+		engine: envelope.engine || 'claude',
 		systemPrompt: envelope.systemPrompt || null,
 		maxTurns: envelope.maxTurns || null,
 		mcpConfig: envelope.mcpConfig || null,
@@ -648,6 +651,136 @@ async function runPersistentClaude(envelope, relay, emit) {
 	});
 }
 
+// ─── CODEX ENGINE (2026-07-18) ──────────────────────────────────────────────
+// The "second base" that isn't a second base: same box, same machinery, a
+// different engine. codex runs ONE-SHOT per turn (`codex exec --json` emits
+// JSONL and exits — the binary is fast; warmth comes from the box itself).
+// The adapter translates codex events INTO claude stream-json and feeds them
+// through handleClaudeStdout — so the relay, the Worker translator, the save
+// callback and usage metering all work with ZERO downstream changes ("codex
+// just speaks the same format"). Continuity = the same engine-agnostic refold
+// (priorContext) claude uses on respawn; files continuity = the chat volume.
+// AUTH (fase 1): CODEX_API_KEY via spawn env — a STATIC key, same contract as
+// ccApiKey: no credentials file, no watcher, nothing rotates (doctrine has
+// nothing to say here — there is no rotation to own).
+async function runCodexTurn(envelope, relay, emit) {
+	// A live claude from a previous engine on this box (chat switched engines)
+	// must not linger — kill it; the codex golden lives in its own namespace.
+	if (claudeProc) await killClaude('engine_switch');
+
+	// CONTEXT REFOLD: codex is fresh every turn, so fold whenever priorContext
+	// exists. Sentinel check keeps it idempotent with the Worker's pre-fold.
+	let promptContent = envelope.prompt;
+	if (envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
+		promptContent = `${envelope.priorContext}\n\n## Mensagem atual do usuário\n\n${promptContent}`;
+		emit('phase', { name: 'context_refolded', ts: nowMs(), chars: envelope.priorContext.length });
+	}
+
+	// Feed claude-format lines through the NORMAL stdout pipeline (relay write,
+	// phase markers, result capture). This is the whole adapter trick.
+	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	let turnDone;
+	const done = new Promise((r) => { turnDone = r; });
+	activeTurn = {
+		relay, emit, t_spawn: nowMs(),
+		firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
+		resolve: turnDone,
+	};
+
+	const lastMsgFile = `/tmp/codex-last-${Date.now()}.txt`;
+	const args = [
+		'exec', '--json',
+		// The microVM IS the sandbox (same rationale as claude's bypass) — codex's
+		// own sandbox off, full access inside the box.
+		'--sandbox', 'danger-full-access',
+		'--ignore-user-config',
+		'-C', process.env.RUN_CWD || '/workspace',
+		'--output-last-message', lastMsgFile,
+	];
+	if (envelope.model) args.push('-m', envelope.model);
+	args.push(promptContent);
+	emit('phase', { name: 'codex_spawn', ts: nowMs() });
+	const proc = spawn('codex', args, {
+		cwd: process.env.RUN_CWD || '/workspace',
+		// CODEX_API_KEY is the codex-exec-scoped var; OPENAI_API_KEY belt-and-
+		// suspenders for CLI versions that read the generic one.
+		env: { ...process.env, CODEX_API_KEY: envelope.codexApiKey, OPENAI_API_KEY: envelope.codexApiKey },
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
+
+	let buf = '';
+	let finalText = '';
+	let usage = null;
+	let sessionId = '';
+	const stderrTail = [];
+	proc.stdout.on('data', (chunk) => {
+		buf += chunk.toString('utf8');
+		let nl;
+		while ((nl = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			let ev;
+			try { ev = JSON.parse(line); } catch { continue; }
+			if (!ev || typeof ev !== 'object') continue;
+			if (ev.type === 'thread.started' && ev.thread_id) sessionId = String(ev.thread_id);
+			if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') usage = ev.usage;
+			const item = ev.item && typeof ev.item === 'object' ? ev.item : null;
+			if (ev.type === 'item.completed' && item) {
+				if (item.type === 'agent_message' && typeof item.text === 'string') {
+					finalText = item.text; // last agent_message wins (pre -o fallback)
+					feed({ type: 'content_block_delta', delta: { type: 'text_delta', text: item.text } });
+				} else if (item.type === 'reasoning' && typeof item.text === 'string') {
+					feed({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: item.text } });
+				} else if (item.type === 'command_execution') {
+					feed({ type: 'tool_result', name: 'bash', is_error: item.exit_code !== 0 && item.exit_code != null, content: String(item.aggregated_output || '').slice(0, 2000) });
+				}
+			} else if (ev.type === 'item.started' && item && item.type === 'command_execution') {
+				feed({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'bash', input: { command: String(item.command || '') } } });
+			} else if (ev.type === 'error' || ev.type === 'turn.failed') {
+				const msg = (ev.error && (ev.error.message || ev.error)) || ev.message || 'codex error';
+				emit('error', { code: 'codex_failed', message: String(msg).slice(0, 500), retryable: false });
+			}
+		}
+	});
+	proc.stderr.on('data', (c) => {
+		stderrTail.push(c);
+		let total = 0;
+		for (const b of stderrTail) total += b.length;
+		while (total > 65536 && stderrTail.length > 1) total -= stderrTail.shift().length;
+	});
+
+	proc.on('exit', (code) => {
+		// --output-last-message is the AUTHORITATIVE final text — survives any
+		// schema drift in the --json events across codex versions.
+		try {
+			const last = fs.readFileSync(lastMsgFile, 'utf8').trim();
+			if (last) finalText = last;
+		} catch { /* no file — keep what the events gave us */ }
+		try { fs.rmSync(lastMsgFile, { force: true }); } catch { /* best-effort */ }
+		if (code !== 0 && !finalText) {
+			const tail = Buffer.concat(stderrTail).toString('utf8').slice(-512);
+			emit('error', { code: 'codex_exit', message: `codex exited ${code}${tail ? `\nstderr: ${tail}` : ''}`, retryable: false });
+		}
+		// claude-format result closes the turn: pendingResult (save callback) +
+		// the Worker translator's finish, exactly like a claude turn.
+		feed({
+			type: 'result',
+			result: finalText,
+			...(sessionId ? { session_id: sessionId } : {}),
+			usage: {
+				input_tokens: (usage && Number(usage.input_tokens)) || 0,
+				output_tokens: (usage && Number(usage.output_tokens)) || 0,
+			},
+		});
+		emit('phase', { name: 'codex_exit', ts: nowMs(), code });
+		turnDone(); // idempotent — feed(result) normally resolved it already
+	});
+
+	await done;
+}
+
 // ---------------------------------------------------------------------------
 // AUTH — trust-on-first-RUN key pinning (2026-07-07 audit: /run had NO auth at
 // all; anything with network reach could run claude with bypassPermissions).
@@ -902,6 +1035,21 @@ const server = http.createServer(async (req, res) => {
 			// model (no-op) — the ack proves the CLI is up and serving its stdin
 			// protocol. Auth itself is exercised on first real inference (measured
 			// ~52ms — the entire thing the 'ok' used to pre-pay).
+			if (envelope.engine === 'codex') {
+				// CODEX WARMUP: one-shot engine — nothing persistent to boot. The ack
+				// is the binary answering; the golden photo carries a box where the
+				// adapter is up and codex is exercised (fs caches hot).
+				if (!envelope.codexApiKey) throw new Error('codexApiKey required for codex warmup');
+				const ok = await new Promise((resolve) => {
+					const p = spawn('codex', ['--version'], { stdio: ['ignore', 'ignore', 'ignore'] });
+					const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 15_000);
+					p.on('exit', (code) => { clearTimeout(t); resolve(code === 0); });
+					p.on('error', () => { clearTimeout(t); resolve(false); });
+				});
+				emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: ok, engine: 'codex' });
+				if (!ok) emit('error', { code: 'warmup_no_ack', message: 'codex binary did not answer', retryable: true });
+				return; // no claude state to set
+			}
 			if (!envelope.ccToken && !envelope.ccApiKey) throw new Error('ccToken or ccApiKey required for warmupOnly');
 			if (!claudeProc || claudeProc.exitCode !== null || claudeSig !== coreSignature(envelope)) {
 				if (claudeProc) await killClaude('warmup_respawn');
@@ -923,6 +1071,13 @@ const server = http.createServer(async (req, res) => {
 			const alive = await trySetModel(envelope.model || claudeModel || 'claude-opus-4-8', 15_000);
 			emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: alive });
 			if (!alive) emit('error', { code: 'warmup_no_ack', message: 'claude did not ack the control ping', retryable: true });
+		} else if (mode === 'cc-cli' && envelope.engine === 'codex') {
+			// CODEX ENGINE: same lane, different brain. One-shot per turn; the
+			// adapter feeds claude-format events so everything downstream is shared.
+			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
+			if (!envelope.codexApiKey) throw new Error('codexApiKey required for engine=codex');
+			await runCodexTurn(envelope, relay, emit);
+			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
 		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
 			if (!envelope.ccToken && !envelope.ccApiKey) throw new Error('ccToken or ccApiKey required for mode=cc-cli');
