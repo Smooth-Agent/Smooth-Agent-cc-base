@@ -66,6 +66,10 @@ let claudeModel = null;
 /** Last ccToken written to .credentials.json. A new turn with a different token is
  *  swapped in place (credentials rewritten, process reused) — NOT a respawn. */
 let claudeTokenHash = null;
+/** How the running claude authenticates: 'oauth' (.credentials.json, self-rotating,
+ *  watcher on) | 'apiKey' (ANTHROPIC_API_KEY spawn env — static, NO watcher, and a
+ *  key change REQUIRES a respawn: env vars can't be swapped into a live process). */
+let claudeAuthKind = null;
 /** Per-turn handler binding — null when no /run is in flight. */
 let activeTurn = null;
 /** Rolling stdout buffer so we can split partial NDJSON lines across data chunks. */
@@ -234,6 +238,16 @@ function startCredWatcher(callback) {
 let credWatcherReport = null;
 
 /**
+ * API-key mode: static key, nothing EVER rotates — unbind the callback so a
+ * stray fs event (or the post-turn sweep) can never POST a phantom "rotation".
+ * The report closure re-reads credWatcherCallback at call time, so nulling it
+ * here disarms reporting; the next oauth turn's startCredWatcher rebinds it.
+ */
+function stopCredWatcher() {
+	credWatcherCallback = null;
+}
+
+/**
  * Build claude argv for LONG-RUNNING mode (stream-json on stdin).
  *
  * Critical differences from one-shot mode:
@@ -340,6 +354,7 @@ async function killClaude(reason) {
 	claudeSig = null;
 	claudeModel = null;
 	claudeTokenHash = null;
+	claudeAuthKind = null;
 	stdoutLineBuffer = '';
 	try { proc.kill('SIGTERM'); } catch { /* already dead */ }
 	await new Promise((resolve) => {
@@ -358,7 +373,9 @@ function spawnPersistentClaude(envelope) {
 	const args = buildClaudeArgs(envelope);
 	const proc = spawn('claude', args, {
 		cwd: process.env.RUN_CWD || '/workspace',
-		env: process.env,
+		// API-key auth: the key rides the SPAWN env (claude reads ANTHROPIC_API_KEY
+		// natively) — never written to disk, never in .credentials.json.
+		env: envelope.ccApiKey ? { ...process.env, ANTHROPIC_API_KEY: envelope.ccApiKey } : process.env,
 		stdio: ['pipe', 'pipe', 'pipe'],
 	});
 	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length });
@@ -399,6 +416,7 @@ function spawnPersistentClaude(envelope) {
 			claudeSig = null;
 			claudeModel = null;
 			claudeTokenHash = null;
+			claudeAuthKind = null;
 			stdoutLineBuffer = '';
 		}
 	});
@@ -406,7 +424,8 @@ function spawnPersistentClaude(envelope) {
 	claudeProc = proc;
 	claudeSig = coreSignature(envelope);
 	claudeModel = envelope.model || null;
-	claudeTokenHash = tokenHash(envelope.ccToken);
+	claudeAuthKind = envelope.ccApiKey ? 'apiKey' : 'oauth';
+	claudeTokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
 	return proc;
 }
 
@@ -494,7 +513,10 @@ function handleClaudeStdout(chunk) {
 async function runPersistentClaude(envelope, relay, emit) {
 	const newCore = coreSignature(envelope);
 	const newModel = envelope.model || null;
-	const newTokenHash = tokenHash(envelope.ccToken);
+	// Auth kind: ccApiKey (static Anthropic API key → spawn env) beats the OAuth
+	// trio when present — the Worker sends one OR the other, never both.
+	const newAuthKind = envelope.ccApiKey ? 'apiKey' : 'oauth';
+	const newTokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
 
 	// MODEL SWAP (not respawn): the model is a per-request API parameter — same CC,
 	// same context, any model. When ONLY the model differs, ask the running claude to
@@ -532,19 +554,33 @@ async function runPersistentClaude(envelope, relay, emit) {
 		claudeProc.exitCode !== null ||
 		claudeSig !== newCore ||
 		claudeModel !== newModel ||
+		// Auth transport changed (oauth↔apiKey), or the STATIC key itself changed —
+		// ANTHROPIC_API_KEY lives in the spawn env, it can't be swapped in place.
+		claudeAuthKind !== newAuthKind ||
+		(newAuthKind === 'apiKey' && claudeTokenHash !== newTokenHash) ||
 		envelope.forceRespawn === true;
 
 	if (needsRespawn) {
 		if (claudeProc) {
-			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newCore ? 'args_changed' : (claudeModel !== newModel ? 'model_swap_failed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead'))) });
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newCore ? 'args_changed' : (claudeAuthKind !== newAuthKind ? 'auth_changed' : (claudeModel !== newModel ? 'model_swap_failed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead')))) });
 			await killClaude('respawn');
 		}
-		// Refresh credentials.json on disk and (only on first ever turn) wipe
-		// stale session lockfiles. Token may have rotated even when session
-		// args are the same, so always rewrite credentials before spawn.
+		// Refresh credentials on disk and (only on first ever turn) wipe stale
+		// session lockfiles. Token may have rotated even when session args are
+		// the same, so always rewrite credentials before spawn.
 		wipeClaudeState();
-		configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
-		startCredWatcher(envelope.callback);
+		if (newAuthKind === 'apiKey') {
+			// API-key auth: the key rides the spawn env (spawnPersistentClaude).
+			// Remove any OAuth credentials left on disk (a golden baked with a sub,
+			// or a prior oauth turn) so claude can't prefer the stale OAuth pair —
+			// and DO NOT start the credWatcher: static keys never rotate, there is
+			// nothing to capture (doctrine untouched — no rotation exists here).
+			try { fs.rmSync(CRED_FILE_PATH(), { force: true }); } catch { /* best-effort */ }
+			stopCredWatcher();
+		} else {
+			configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+			startCredWatcher(envelope.callback);
+		}
 		const t_spawn_called = nowMs();
 		emit('phase', { name: 'pre_claude_spawn', ts: t_spawn_called });
 		spawnPersistentClaude(envelope);
@@ -561,12 +597,14 @@ async function runPersistentClaude(envelope, relay, emit) {
 		// tracked hash; claude re-reads it on its next self-refresh, and its still-valid
 		// in-memory token keeps working until then. Do NOT wipeClaudeState() here — the
 		// session lockfiles/caches are exactly the warmth we're keeping (that's the win).
-		if (claudeTokenHash !== newTokenHash) {
+		if (newAuthKind === 'oauth' && claudeTokenHash !== newTokenHash) {
 			configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
 			claudeTokenHash = newTokenHash;
 			emit('phase', { name: 'claude_token_swapped', ts: nowMs() });
 		}
-		startCredWatcher(envelope.callback);
+		// apiKey mode: static key (a changed key respawned above); keep the
+		// watcher DISARMED — there is no rotation to capture.
+		if (newAuthKind === 'oauth') startCredWatcher(envelope.callback);
 		emit('phase', { name: 'claude_reused', ts: nowMs() });
 		activeTurn = {
 			relay, emit, t_spawn: nowMs(),
@@ -864,24 +902,30 @@ const server = http.createServer(async (req, res) => {
 			// model (no-op) — the ack proves the CLI is up and serving its stdin
 			// protocol. Auth itself is exercised on first real inference (measured
 			// ~52ms — the entire thing the 'ok' used to pre-pay).
-			if (!envelope.ccToken) throw new Error('ccToken required for warmupOnly');
+			if (!envelope.ccToken && !envelope.ccApiKey) throw new Error('ccToken or ccApiKey required for warmupOnly');
 			if (!claudeProc || claudeProc.exitCode !== null || claudeSig !== coreSignature(envelope)) {
 				if (claudeProc) await killClaude('warmup_respawn');
 				wipeClaudeState();
-				configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
-				startCredWatcher(envelope.callback);
+				if (envelope.ccApiKey) {
+					// API-key warmup (akey: goldens): key via spawn env, no creds file, no watcher.
+					try { fs.rmSync(CRED_FILE_PATH(), { force: true }); } catch { /* best-effort */ }
+					stopCredWatcher();
+				} else {
+					configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+					startCredWatcher(envelope.callback);
+				}
 				emit('phase', { name: 'pre_claude_spawn', ts: nowMs() });
 				spawnPersistentClaude(envelope);
 				claudeSig = coreSignature(envelope);
 				claudeModel = envelope.model || null;
-				claudeTokenHash = tokenHash(envelope.ccToken);
+				claudeTokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
 			}
 			const alive = await trySetModel(envelope.model || claudeModel || 'claude-opus-4-8', 15_000);
 			emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: alive });
 			if (!alive) emit('error', { code: 'warmup_no_ack', message: 'claude did not ack the control ping', retryable: true });
 		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
-			if (!envelope.ccToken) throw new Error('ccToken required for mode=cc-cli');
+			if (!envelope.ccToken && !envelope.ccApiKey) throw new Error('ccToken or ccApiKey required for mode=cc-cli');
 
 			// R2 workspace sync REMOVED (2026-07-07). It was disabled behind
 			// `if (false && ...)` since the D1-priorContext model made it pure
