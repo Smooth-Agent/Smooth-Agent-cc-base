@@ -1,28 +1,33 @@
 #!/usr/bin/env node
 /**
- * SmoothAgent runtime HTTP server (port 8080).
+ * SmoothAgent runtime HTTP server (port 8080) — the box-side adapter.
  *
- * Single-purpose: receives one POST /run with an envelope, spawns claude
- * (or the customer-configured agent), pipes stdout chunks back to the
- * client in real-time via HTTP chunked transfer encoding, then exits so
- * the Fly machine auto-destroys.
+ * Runs PERSISTENT inside a Detona microVM (snapshot/resume physics: everything
+ * in process globals gets frozen into golden forks — see the SNAPSHOT TRAP notes
+ * inline). One /run per turn (concurrent /run → 409), streamed back chunked;
+ * the box survives across turns (Detona pauses it, resume restores byte-intact).
  *
- * Why HTTP server vs Fly's REST exec:
- *   Fly REST exec is buffered — it waits for the command to exit before
- *   returning stdout. claude emits stream-json events as it generates each
- *   token, but with REST exec the user sees nothing until the whole turn
- *   completes. With this server, each chunk claude emits is forwarded to
- *   the wire immediately — true streaming.
+ * MODES (envelope.mode):
+ *   cc-cli — an AGENT ENGINE runs the turn:
+ *     engine 'claude' (default): persistent claude process, --input-format
+ *       stream-json; reused across turns when the core signature matches
+ *       (respawn on args_changed/auth_changed/model_swap_failed/dead).
+ *     engine 'codex' (2026-07-18): OpenAI Codex CLI, ONE-SHOT per turn
+ *       (codex exec --json); runCodexTurn translates its JSONL into claude
+ *       stream-json so everything downstream is engine-agnostic.
+ *   slot   — the CLIENT's persistent server (SLOT_CONTRACT.md).
+ *   build/exec — plain command runs (image prep, layer authoring).
  *
- * Token handling:
- *   ccToken arrives in POST body (memory only). Written to a 0600 mode
- *   credentials file under $HOME/.claude/. Never logged, never echoed,
- *   never persisted on volume (lives in tmpfs of HOME).
+ * AUTH (never logged, never echoed):
+ *   claude sub  — ccToken/ccRefreshToken/ccExpiresAt → .credentials.json (0600);
+ *     claude is the ONLY rotator (token doctrine, core/V2_TOKEN_REFRESH.md);
+ *     the credWatcher reports rotations back to the Worker.
+ *   claude key  — ccApiKey → ANTHROPIC_API_KEY at spawn (static, no watcher).
+ *   codex key   — codexApiKey → CODEX_API_KEY at spawn (static, no watcher).
  *
- * Lifecycle:
- *   server.listen on 0.0.0.0:8080 → /run handles ONE request → process.exit
- *   when claude exits. Fly auto_destroy=true cleans up the machine.
- *   If a second /run arrives during the first, it's rejected 409.
+ * Streaming: each stdout chunk is forwarded to the wire immediately via the
+ * TurnRelay (buffers for F5 replay, fans out to live sinks, fires the save
+ * callback on completion).
  */
 
 const http = require('node:http');

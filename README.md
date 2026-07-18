@@ -2,16 +2,21 @@
 
 The base container image for SmoothAgent agent runs.
 
-> **Architecture v2 (2026-05-14)**: this image is no longer ephemeral-per-turn.
-> The Fly Machine lives for many turns (managed by `core`'s `PoolManagerDO`),
-> and inside it a single `claude` CLI process is kept alive across `/run`
-> calls via `--input-format stream-json`. The ~20s OAuth handshake is paid
-> ONCE per machine boot, not per turn. See `server.js:runPersistentClaude`
-> for the lifecycle and `core/PLAN.md` for the full architecture.
+> **Architecture v3 (Detona, 2026-07)**: the image runs as a **Detona
+> microVM** — snapshot/fork/resume physics (goldens are forks of a warm+authed
+> box; pause frees RAM; resume restores byte-intact). It ships **two agent
+> engines**: `claude` (persistent process, stream-json, kept alive across
+> `/run` calls — see `server.js:runPersistentClaude`) and `codex` (OpenAI
+> Codex CLI, one-shot per turn — `server.js:runCodexTurn` translates its
+> JSONL into claude stream-json so the whole downstream pipeline is
+> engine-agnostic). Plus the **slot runtime** (the client's own persistent
+> server, SLOT_CONTRACT.md) and build/exec modes.
+> The Fly-era pool (`PoolManagerDO`) is history — see git log.
 
 This image runs an HTTP server (`/opt/smoothagent/server.js`) on port 8080
-that accepts envelopes over `POST /run` and drives the long-running claude
-process internally. Customers extend it to bring their own tools and scaffolds.
+that accepts envelopes over `POST /run` and drives the engine internally.
+Customers extend it to bring their own tools and scaffolds (or ship them as
+Detona layers — the client-side primitive).
 
 ```
 ┌──────────────────────────────────────────────┐
