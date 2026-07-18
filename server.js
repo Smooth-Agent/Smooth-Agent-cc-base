@@ -694,6 +694,9 @@ async function runCodexTurn(envelope, relay, emit) {
 		// own sandbox off, full access inside the box.
 		'--sandbox', 'danger-full-access',
 		'--ignore-user-config',
+		// /workspace is not a git repo — without this codex refuses to run
+		// ("Not inside a trusted directory", proven in the image smoke test).
+		'--skip-git-repo-check',
 		'-C', process.env.RUN_CWD || '/workspace',
 		'--output-last-message', lastMsgFile,
 	];
