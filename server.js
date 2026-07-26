@@ -252,6 +252,49 @@ function stopCredWatcher() {
 	credWatcherCallback = null;
 }
 
+// ─── CODEX SUB AUTH WATCHER (2026-07-26) ────────────────────────────────────
+// Mirror of the CC credWatcher for the codex subscription. The codex CLI
+// self-rotates $CODEX_HOME/auth.json in place (it IS the only rotator, same
+// doctrine); when it does, we mirror the new auth.json back to the Worker so
+// the stored sub never drifts stale. Reports to /internal/codex-credentials.
+let codexAuthCallback = null;
+let codexAuthWatcherStarted = false;
+let codexAuthLastReported = '';
+function codexAuthFingerprint() {
+	try { const s = fs.statSync(CODEX_AUTH_PATH()); return `${s.size}:${s.mtimeMs}`; } catch { return ''; }
+}
+function startCodexAuthWatcher(callback) {
+	if (callback && callback.url) codexAuthCallback = callback; // rebind every turn (snapshot trap)
+	if (codexAuthWatcherStarted || !codexAuthCallback) return;
+	codexAuthWatcherStarted = true;
+	const report = async () => {
+		try {
+			const cb = codexAuthCallback;
+			if (!cb || !cb.url) return;
+			const fp = codexAuthFingerprint();
+			if (!fp || fp === codexAuthLastReported) return;
+			const raw = fs.readFileSync(CODEX_AUTH_PATH(), 'utf8');
+			if (!raw.trim()) return;
+			codexAuthLastReported = fp;
+			const url = cb.url.replace(/\/internal\/chat-result$/, '/internal/codex-credentials');
+			const r = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(cb.jwt ? { Authorization: `Bearer ${cb.jwt}` } : {}) },
+				body: JSON.stringify({ authJson: raw }), // the full auth.json (never logged)
+			});
+			if (!r.ok) codexAuthLastReported = ''; // failed → retry next sweep
+			logInfo('codex auth rotation reported', { status: r.status });
+		} catch (e) { codexAuthLastReported = ''; logError('codex auth report failed', { msg: e && e.message }); }
+	};
+	try {
+		fs.watch(CODEX_HOME, { persistent: false }, (_evt, fname) => {
+			if (fname === 'auth.json') setTimeout(report, 150);
+		});
+	} catch (e) { logError('codex auth watcher failed to start', { msg: e && e.message }); }
+	codexAuthReport = report;
+}
+let codexAuthReport = null;
+
 /**
  * Build claude argv for LONG-RUNNING mode (stream-json on stdin).
  *
@@ -665,9 +708,14 @@ async function runPersistentClaude(envelope, relay, emit) {
 // callback and usage metering all work with ZERO downstream changes ("codex
 // just speaks the same format"). Continuity = the same engine-agnostic refold
 // (priorContext) claude uses on respawn; files continuity = the chat volume.
-// AUTH (fase 1): CODEX_API_KEY via spawn env — a STATIC key, same contract as
-// ccApiKey: no credentials file, no watcher, nothing rotates (doctrine has
-// nothing to say here — there is no rotation to own).
+// AUTH — two modes, priority SUB > key:
+//  · sub  (envelope.codexAuth): the ChatGPT-subscription auth.json, written to
+//    $CODEX_HOME/auth.json. codex self-rotates it (same doctrine as the CC sub:
+//    the ENGINE is the only rotator; a watcher captures the rotation back).
+//  · key  (envelope.codexApiKey): CODEX_API_KEY at spawn — static, no rotation.
+const CODEX_HOME = process.env.CODEX_HOME || '/workspace/.codex';
+function CODEX_AUTH_PATH() { return path.join(CODEX_HOME, 'auth.json'); }
+
 async function runCodexTurn(envelope, relay, emit) {
 	// A live claude from a previous engine on this box (chat switched engines)
 	// must not linger — kill it; the codex golden lives in its own namespace.
@@ -707,12 +755,28 @@ async function runCodexTurn(envelope, relay, emit) {
 	];
 	if (envelope.model) args.push('-m', envelope.model);
 	args.push(promptContent);
-	emit('phase', { name: 'codex_spawn', ts: nowMs() });
+
+	// AUTH: sub (auth.json) wins over the static key. The sub is written to
+	// $CODEX_HOME/auth.json where the CLI reads it (and self-rotates it in place —
+	// the watcher below captures the rotation back, mirroring the CC credWatcher).
+	const codexEnv = { ...process.env, CODEX_HOME };
+	if (envelope.codexAuth) {
+		try {
+			fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 });
+			fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 });
+			codexAuthLastReported = codexAuthFingerprint();
+			startCodexAuthWatcher(envelope.callback);
+		} catch (e) { logError('codex auth.json write failed', { msg: e && e.message }); }
+	} else if (envelope.codexApiKey) {
+		// static key mode — no auth.json, no watcher.
+		try { fs.rmSync(CODEX_AUTH_PATH(), { force: true }); } catch {}
+		codexEnv.CODEX_API_KEY = envelope.codexApiKey;
+		codexEnv.OPENAI_API_KEY = envelope.codexApiKey;
+	}
+	emit('phase', { name: 'codex_spawn', ts: nowMs(), auth: envelope.codexAuth ? 'sub' : 'key' });
 	const proc = spawn('codex', args, {
 		cwd: process.env.RUN_CWD || '/workspace',
-		// CODEX_API_KEY is the codex-exec-scoped var; OPENAI_API_KEY belt-and-
-		// suspenders for CLI versions that read the generic one.
-		env: { ...process.env, CODEX_API_KEY: envelope.codexApiKey, OPENAI_API_KEY: envelope.codexApiKey },
+		env: codexEnv,
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
@@ -787,6 +851,62 @@ async function runCodexTurn(envelope, relay, emit) {
 	});
 
 	await done;
+}
+
+// CODEX SUB CONNECT (device flow via the official CLI — passes OpenAI's WAF).
+// Streams the device URL + code out as normal assistant text (so the Studio shows
+// them with no translator change), keeps the CLI polling, and on success mirrors
+// the resulting auth.json to the Worker via the callback.
+async function runCodexLogin(envelope, relay, emit) {
+	if (claudeProc) await killClaude('codex_login'); // free the box's engine slot
+	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	let done; const p = new Promise((r) => { done = r; });
+	activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
+	feed({ type: 'system', subtype: 'init' });
+
+	try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
+	emit('phase', { name: 'codex_login_spawn', ts: nowMs() });
+	const proc = spawn('codex', ['login', '--device-auth'], {
+		cwd: '/workspace', env: { ...process.env, CODEX_HOME }, stdio: ['ignore', 'pipe', 'pipe'],
+	});
+
+	let buf = '', url = '', code = '', announced = false;
+	const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, ''); // drop ANSI colors
+	const scan = (chunk) => {
+		buf += strip(chunk.toString('utf8'));
+		const u = buf.match(/https:\/\/auth\.openai\.com\/[^\s]+/);
+		const c = buf.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b/);
+		if (u) url = u[0];
+		if (c) code = c[1];
+		if (!announced && url && code) {
+			announced = true;
+			emit('phase', { name: 'codex_device_code', ts: nowMs(), url, code });
+			feed({ type: 'content_block_delta', delta: { type: 'text_delta', text:
+				`🔗 **Conectar Codex (sua sub ChatGPT)**\n\n1. Abra: ${url}\n2. Digite o código: **${code}**\n3. Autorize com sua conta ChatGPT\n\n_Aguardando autorização (expira em 15 min)…_\n` } });
+		}
+	};
+	proc.stdout.on('data', scan);
+	proc.stderr.on('data', scan);
+
+	proc.on('exit', async (exitCode) => {
+		let ok = false;
+		try {
+			const raw = fs.readFileSync(CODEX_AUTH_PATH(), 'utf8');
+			if (raw.trim() && envelope.callback && envelope.callback.url) {
+				const cbUrl = envelope.callback.url.replace(/\/internal\/chat-result$/, '/internal/codex-credentials');
+				const r = await fetch(cbUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(envelope.callback.jwt ? { Authorization: `Bearer ${envelope.callback.jwt}` } : {}) }, body: JSON.stringify({ authJson: raw }) });
+				ok = r.ok;
+			}
+		} catch (e) { logError('codex login capture failed', { msg: e && e.message }); }
+		feed({ type: 'content_block_delta', delta: { type: 'text_delta', text: ok ? '\n✅ **Codex conectado!** Sua sub está pronta — escolha um modelo Codex e mande uma mensagem.' : `\n❌ Login não completou${exitCode ? ` (código ${exitCode})` : ''}. Tente de novo.` } });
+		feed({ type: 'result', result: ok ? 'codex_connected' : 'codex_login_failed', usage: { input_tokens: 0, output_tokens: 0 } });
+		emit('phase', { name: 'codex_login_exit', ts: nowMs(), ok, code: exitCode });
+		done();
+	});
+
+	// Safety: the CLI polls up to 15min; cap our wait a touch under Detona's turn timeout.
+	setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 14 * 60 * 1000);
+	await p;
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,11 +1199,18 @@ const server = http.createServer(async (req, res) => {
 			const alive = await trySetModel(envelope.model || claudeModel || 'claude-opus-4-8', 15_000);
 			emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: alive });
 			if (!alive) emit('error', { code: 'warmup_no_ack', message: 'claude did not ack the control ping', retryable: true });
+		} else if (mode === 'codex-login') {
+			// CODEX SUB CONNECT: run `codex login --device-auth` (the official CLI
+			// passes OpenAI's WAF where our Worker gets 403). Stream the device code +
+			// URL out so the Studio shows them; keep polling; when the user authorizes
+			// in THEIR browser, the CLI writes auth.json → we mirror it to the Worker.
+			await runCodexLogin(envelope, relay, emit);
+			emit('phase', { name: 'codex_login_done', ts: nowMs() });
 		} else if (mode === 'cc-cli' && envelope.engine === 'codex') {
 			// CODEX ENGINE: same lane, different brain. One-shot per turn; the
 			// adapter feeds claude-format events so everything downstream is shared.
 			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
-			if (!envelope.codexApiKey) throw new Error('codexApiKey required for engine=codex');
+			if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codexAuth (sub) or codexApiKey required for engine=codex');
 			await runCodexTurn(envelope, relay, emit);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
 		} else if (mode === 'cc-cli') {
