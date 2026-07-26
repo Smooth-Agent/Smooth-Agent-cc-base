@@ -721,14 +721,6 @@ async function runCodexTurn(envelope, relay, emit) {
 	// must not linger — kill it; the codex golden lives in its own namespace.
 	if (claudeProc) await killClaude('engine_switch');
 
-	// CONTEXT REFOLD: codex is fresh every turn, so fold whenever priorContext
-	// exists. Sentinel check keeps it idempotent with the Worker's pre-fold.
-	let promptContent = envelope.prompt;
-	if (envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
-		promptContent = `${envelope.priorContext}\n\n## Mensagem atual do usuário\n\n${promptContent}`;
-		emit('phase', { name: 'context_refolded', ts: nowMs(), chars: envelope.priorContext.length });
-	}
-
 	// Feed claude-format lines through the NORMAL stdout pipeline (relay write,
 	// phase markers, result capture). This is the whole adapter trick.
 	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
@@ -740,21 +732,59 @@ async function runCodexTurn(envelope, relay, emit) {
 		resolve: turnDone,
 	};
 
+	// SESSION REUSE ("como usar o codex normal", 2026-07-26): the per-chat volume
+	// persists $CODEX_HOME across turns (volume-as-upper — every path the box writes
+	// lands on the volume), so codex's OWN session rollout survives. When one exists
+	// we RESUME it (`codex exec resume --last`) and send ONLY the new message — codex
+	// keeps the conversation, the files it read, and its plan (tokIn stays flat, no
+	// manual transcript refold, no re-derivation). Only a fresh chat — or a reset that
+	// wiped the volume — starts a new session. Mirrors claude's warm-resume, but via
+	// codex's session files instead of a resident process (codex exec is one-shot).
+	const RUN_CWD = process.env.RUN_CWD || '/workspace';
+	const sessionsDir = path.join(CODEX_HOME, 'sessions');
+	let hasSession = false;
+	try {
+		hasSession = fs.existsSync(sessionsDir) &&
+			fs.readdirSync(sessionsDir).some((f) => /\.jsonl$/.test(f) || (() => {
+				try { return fs.statSync(path.join(sessionsDir, f)).isDirectory(); } catch { return false; }
+			})());
+	} catch { /* no sessions dir yet → fresh */ }
+
+	// The RAW new message, even if the Worker pre-folded the transcript into the
+	// prompt (sentinel split): resume must NOT re-send the history codex already has.
+	const rawUserMessage = (p) => {
+		const marker = '## Mensagem atual do usuário\n\n';
+		const s = String(p == null ? '' : p);
+		const i = s.lastIndexOf(marker);
+		return i >= 0 ? s.slice(i + marker.length) : s;
+	};
+
 	const lastMsgFile = `/tmp/codex-last-${Date.now()}.txt`;
-	const args = [
-		'exec', '--json',
-		// The microVM IS the sandbox (same rationale as claude's bypass) — codex's
-		// own sandbox off, full access inside the box.
-		'--sandbox', 'danger-full-access',
-		'--ignore-user-config',
-		// /workspace is not a git repo — without this codex refuses to run
-		// ("Not inside a trusted directory", proven in the image smoke test).
-		'--skip-git-repo-check',
-		'-C', process.env.RUN_CWD || '/workspace',
-		'--output-last-message', lastMsgFile,
-	];
-	if (envelope.model) args.push('-m', envelope.model);
-	args.push(promptContent);
+	// Flags accepted by BOTH `exec` and `exec resume`.
+	const commonFlags = ['--json', '--ignore-user-config', '--skip-git-repo-check', '--output-last-message', lastMsgFile];
+	let args;
+	if (hasSession) {
+		// resume the chat's session — `resume` inherits the session's cwd + sandbox
+		// (it doesn't accept -C/--sandbox), so we bypass approvals+sandbox for the
+		// same full-access-in-the-microVM behavior as the fresh path below.
+		args = ['exec', 'resume', '--last', ...commonFlags, '--dangerously-bypass-approvals-and-sandbox'];
+		if (envelope.model) args.push('-m', envelope.model);
+		args.push(rawUserMessage(envelope.prompt));
+		emit('phase', { name: 'codex_resume', ts: nowMs() });
+	} else {
+		// fresh session. Fold prior context if present (cold box mid-chat with the
+		// session gone — the correctness safety net; idempotent via the sentinel).
+		let promptContent = envelope.prompt;
+		if (envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
+			promptContent = `${envelope.priorContext}\n\n## Mensagem atual do usuário\n\n${promptContent}`;
+			emit('phase', { name: 'context_refolded', ts: nowMs(), chars: envelope.priorContext.length });
+		}
+		// The microVM IS the sandbox → codex's own sandbox off (full access), and
+		// --skip-git-repo-check because /workspace is not a git repo.
+		args = ['exec', ...commonFlags, '--sandbox', 'danger-full-access', '-C', RUN_CWD];
+		if (envelope.model) args.push('-m', envelope.model);
+		args.push(promptContent);
+	}
 
 	// AUTH: sub (auth.json) wins over the static key. The sub is written to
 	// $CODEX_HOME/auth.json where the CLI reads it (and self-rotates it in place —
