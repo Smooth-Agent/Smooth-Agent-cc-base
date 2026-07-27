@@ -762,14 +762,14 @@ async function runCodexTurn(envelope, relay, emit) {
 	const lastMsgFile = `/tmp/codex-last-${Date.now()}.txt`;
 	// Flags accepted by BOTH `exec` and `exec resume`.
 	const commonFlags = ['--json', '--ignore-user-config', '--skip-git-repo-check', '--output-last-message', lastMsgFile];
-	// Model + REASONING EFFORT. The model id may carry the effort as `gpt-5:high`
-	// (codex's real knob for gpt-5 on a ChatGPT account — minimal|low|medium|high);
-	// split it into `-m gpt-5 -c model_reasoning_effort=high`.
+	// Model + REASONING EFFORT — independent. A ChatGPT-account sub can't pick a
+	// model (OpenAI 400s every explicit id — only the account default works), so we
+	// OMIT -m there and drive the sole real knob, reasoning effort, via
+	// `-c model_reasoning_effort=<minimal|low|medium|high>`. A key-based codex (API)
+	// still gets -m for its real model. Both honor codexReasoning when set.
 	const pushModel = (a) => {
-		if (!envelope.model) return;
-		const [m, effort] = String(envelope.model).split(':');
-		a.push('-m', m);
-		if (effort) a.push('-c', `model_reasoning_effort=${effort}`);
+		if (envelope.model) a.push('-m', String(envelope.model));
+		if (envelope.codexReasoning) a.push('-c', `model_reasoning_effort=${envelope.codexReasoning}`);
 	};
 	let args;
 	if (hasSession) {
