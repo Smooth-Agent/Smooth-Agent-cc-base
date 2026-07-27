@@ -762,13 +762,22 @@ async function runCodexTurn(envelope, relay, emit) {
 	const lastMsgFile = `/tmp/codex-last-${Date.now()}.txt`;
 	// Flags accepted by BOTH `exec` and `exec resume`.
 	const commonFlags = ['--json', '--ignore-user-config', '--skip-git-repo-check', '--output-last-message', lastMsgFile];
+	// Model + REASONING EFFORT. The model id may carry the effort as `gpt-5:high`
+	// (codex's real knob for gpt-5 on a ChatGPT account — minimal|low|medium|high);
+	// split it into `-m gpt-5 -c model_reasoning_effort=high`.
+	const pushModel = (a) => {
+		if (!envelope.model) return;
+		const [m, effort] = String(envelope.model).split(':');
+		a.push('-m', m);
+		if (effort) a.push('-c', `model_reasoning_effort=${effort}`);
+	};
 	let args;
 	if (hasSession) {
 		// resume the chat's session — `resume` inherits the session's cwd + sandbox
 		// (it doesn't accept -C/--sandbox), so we bypass approvals+sandbox for the
 		// same full-access-in-the-microVM behavior as the fresh path below.
 		args = ['exec', 'resume', '--last', ...commonFlags, '--dangerously-bypass-approvals-and-sandbox'];
-		if (envelope.model) args.push('-m', envelope.model);
+		pushModel(args);
 		args.push(rawUserMessage(envelope.prompt));
 		emit('phase', { name: 'codex_resume', ts: nowMs() });
 	} else {
@@ -782,7 +791,7 @@ async function runCodexTurn(envelope, relay, emit) {
 		// The microVM IS the sandbox → codex's own sandbox off (full access), and
 		// --skip-git-repo-check because /workspace is not a git repo.
 		args = ['exec', ...commonFlags, '--sandbox', 'danger-full-access', '-C', RUN_CWD];
-		if (envelope.model) args.push('-m', envelope.model);
+		pushModel(args);
 		args.push(promptContent);
 	}
 
