@@ -949,6 +949,64 @@ async function runCodexLogin(envelope, relay, emit) {
 }
 
 // ---------------------------------------------------------------------------
+// EXTRACT the codex model catalog from codex's OWN app-server (`model/list` RPC).
+// This is the source of truth — new models appear without any code change. Runs
+// authed when envelope.codexAuth is present (→ the account's entitled models), and
+// posts the parsed list [{id,displayName,description,isDefault,reasoningEfforts}]
+// to /internal/codex-models via the callback. Never a hardcoded list.
+async function runCodexModels(envelope, relay, emit) {
+	if (claudeProc) await killClaude('codex_models');
+	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	let done; const p = new Promise((r) => { done = r; });
+	activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
+	feed({ type: 'system', subtype: 'init' });
+
+	try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
+	if (envelope.codexAuth) {
+		try { fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch {}
+	}
+	emit('phase', { name: 'codex_models_spawn', ts: nowMs() });
+	const proc = spawn('codex', ['app-server'], { cwd: '/workspace', env: { ...process.env, CODEX_HOME }, stdio: ['pipe', 'pipe', 'ignore'] });
+	let buf = '';
+	proc.stdout.on('data', (d) => { buf += d.toString('utf8'); });
+	const send = (o) => { try { proc.stdin.write(JSON.stringify(o) + '\n'); } catch {} };
+	send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'smoothagent', title: 'SmoothAgent', version: '1.0.0' } } });
+	setTimeout(() => send({ jsonrpc: '2.0', id: 2, method: 'model/list', params: {} }), 2000);
+
+	setTimeout(async () => {
+		let models = [];
+		for (const line of buf.split('\n')) {
+			if (!line.trim()) continue;
+			try {
+				const o = JSON.parse(line);
+				if (o.id === 2 && o.result && Array.isArray(o.result.data)) {
+					models = o.result.data.filter((m) => !m.hidden).map((m) => ({
+						id: m.id, model: m.model, displayName: m.displayName, description: m.description,
+						isDefault: !!m.isDefault, defaultReasoningEffort: m.defaultReasoningEffort,
+						reasoningEfforts: (m.supportedReasoningEfforts || []).map((e) => e.reasoningEffort),
+					}));
+				}
+			} catch { /* skip non-JSON */ }
+		}
+		let posted = false;
+		try {
+			if (envelope.callback && envelope.callback.url) {
+				const cbUrl = envelope.callback.url.replace(/\/internal\/chat-result$/, '/internal/codex-models');
+				const r = await fetch(cbUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(envelope.callback.jwt ? { Authorization: `Bearer ${envelope.callback.jwt}` } : {}) }, body: JSON.stringify({ models }) });
+				posted = r.ok;
+			}
+		} catch (e) { logError('codex model/list post failed', { msg: e && e.message }); }
+		emit('phase', { name: 'codex_models_result', ts: nowMs(), count: models.length, posted });
+		feed({ type: 'content_block_delta', delta: { type: 'text_delta', text: JSON.stringify(models) } });
+		feed({ type: 'result', result: 'codex_models', usage: { input_tokens: 0, output_tokens: 0 } });
+		try { proc.kill('SIGKILL'); } catch {}
+		done();
+	}, 6000);
+	setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30_000);
+	await p;
+}
+
+// ---------------------------------------------------------------------------
 // AUTH — trust-on-first-RUN key pinning (2026-07-07 audit: /run had NO auth at
 // all; anything with network reach could run claude with bypassPermissions).
 //
@@ -1245,6 +1303,12 @@ const server = http.createServer(async (req, res) => {
 			// in THEIR browser, the CLI writes auth.json → we mirror it to the Worker.
 			await runCodexLogin(envelope, relay, emit);
 			emit('phase', { name: 'codex_login_done', ts: nowMs() });
+		} else if (mode === 'codex-models') {
+			// EXTRACT the model catalog from codex ITSELF (its app-server `model/list`
+			// RPC) — the source of truth, so new models appear with zero maintenance.
+			// Runs authed (envelope.codexAuth) so the list is the account's entitled set.
+			await runCodexModels(envelope, relay, emit);
+			emit('phase', { name: 'codex_models_done', ts: nowMs() });
 		} else if (mode === 'cc-cli' && envelope.engine === 'codex') {
 			// CODEX ENGINE: same lane, different brain. One-shot per turn; the
 			// adapter feeds claude-format events so everything downstream is shared.
