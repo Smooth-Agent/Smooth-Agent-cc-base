@@ -1261,12 +1261,22 @@ const server = http.createServer(async (req, res) => {
 			// protocol. Auth itself is exercised on first real inference (measured
 			// ~52ms — the entire thing the 'ok' used to pre-pay).
 			if (envelope.engine === 'codex') {
-				// CODEX WARMUP: one-shot engine — nothing persistent to boot. The ack
-				// is the binary answering; the golden photo carries a box where the
-				// adapter is up and codex is exercised (fs caches hot).
-				if (!envelope.codexApiKey) throw new Error('codexApiKey required for codex warmup');
+				// CODEX WARMUP: one-shot engine — nothing persistent to boot. We BAKE the
+				// SUB auth (auth.json) OR the API key into the golden photo, with a CLEAN
+				// session (the seed's throwaway volume — no chat data), so every clone of
+				// this golden is codex-authed and ready. Accepts EITHER credential shape
+				// (sub > key) — the standardization point: a new engine's warmup lives here.
+				if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codex warmup needs codexAuth (sub) or codexApiKey');
+				const codexEnvW = { ...process.env, CODEX_HOME };
+				try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
+				if (envelope.codexAuth) {
+					try { fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch (e) { logError('codex warmup auth.json write failed', { msg: e && e.message }); }
+				} else if (envelope.codexApiKey) {
+					try { fs.rmSync(CODEX_AUTH_PATH(), { force: true }); } catch {}
+					codexEnvW.CODEX_API_KEY = envelope.codexApiKey; codexEnvW.OPENAI_API_KEY = envelope.codexApiKey;
+				}
 				const ok = await new Promise((resolve) => {
-					const p = spawn('codex', ['--version'], { stdio: ['ignore', 'ignore', 'ignore'] });
+					const p = spawn('codex', ['--version'], { env: codexEnvW, stdio: ['ignore', 'ignore', 'ignore'] });
 					const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 15_000);
 					p.on('exit', (code) => { clearTimeout(t); resolve(code === 0); });
 					p.on('error', () => { clearTimeout(t); resolve(false); });
