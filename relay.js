@@ -62,9 +62,14 @@ class TurnRelay {
     if (this.done) return { ok: true, already: true };
     this.done = true;
     this.result = result || null;
-    for (const res of this.sinks) { try { res.end(); } catch { /* closed */ } }
-    this.sinks = [];
-    if (!this.callback) return { ok: true, saved: false };
+    // ORDER INVARIANT (owner, 2026-08-01): SAVE **before** closing the sinks.
+    // Detona's pauseAfter freezes the box the instant the /run stream (a sink)
+    // closes — so if we ended sinks first (the old order), the box could pause
+    // MID-CALLBACK and the answer would never persist. The client already got the
+    // result via the streamed 'result' event, so holding the sink open for the ~1
+    // RTT of the save costs nothing and makes the box pausable ONLY once the answer
+    // is durable. The empty-claim guard still gates the call (no answer → no POST).
+    let outcome = { ok: true, saved: false };
     // EMPTY-CLAIM GUARD (2026-07-11): a run with NOTHING to persist (no text,
     // no usage) must NOT fire the completion callback — the warmupOnly run of
     // the inline fork inherits the TURN's callback jwt, and its empty POST was
@@ -72,29 +77,35 @@ class TurnRelay {
     // result could land. The callback exists to persist an answer; no answer,
     // no call. (Cred rotation capture is unaffected — the watcher has its own
     // dedicated endpoint.)
-    if (!result || (!result.text && !result.usage)) return { ok: true, saved: false };
-    try {
-      const r = await fetch(this.callback.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.callback.jwt ? { Authorization: `Bearer ${this.callback.jwt}` } : {}),
-        },
-        body: JSON.stringify({
-          chatId: this.chatId,
-          promptId: this.promptId,
-          text: (result && result.text) || '',
-          usage: (result && result.usage) || null,
-          // SLOT runtime (SLOT_CONTRACT.md): the slot's opaque conversation
-          // state — the Worker persists it (chats.slot_context) and returns it
-          // as `context` on the next turn. Absent for cc-cli turns.
-          ...(result && typeof result.context === 'string' ? { context: result.context } : {}),
-        }),
-      });
-      return { ok: r.ok, status: r.status, saved: true };
-    } catch (e) {
-      return { ok: false, error: (e && e.message) || 'callback_failed', saved: false };
+    if (this.callback && result && (result.text || result.usage)) {
+      try {
+        const r = await fetch(this.callback.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.callback.jwt ? { Authorization: `Bearer ${this.callback.jwt}` } : {}),
+          },
+          body: JSON.stringify({
+            chatId: this.chatId,
+            promptId: this.promptId,
+            text: (result && result.text) || '',
+            usage: (result && result.usage) || null,
+            // SLOT runtime (SLOT_CONTRACT.md): the slot's opaque conversation
+            // state — the Worker persists it (chats.slot_context) and returns it
+            // as `context` on the next turn. Absent for cc-cli turns.
+            ...(result && typeof result.context === 'string' ? { context: result.context } : {}),
+          }),
+        });
+        outcome = { ok: r.ok, status: r.status, saved: true };
+      } catch (e) {
+        outcome = { ok: false, error: (e && e.message) || 'callback_failed', saved: false };
+      }
     }
+    // Answer is durable (or there was nothing to save) → NOW close the live sinks.
+    // This is the signal Detona waits on to pauseAfter, so it must come last.
+    for (const res of this.sinks) { try { res.end(); } catch { /* closed */ } }
+    this.sinks = [];
+    return outcome;
   }
 }
 
