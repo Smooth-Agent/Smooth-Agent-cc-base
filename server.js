@@ -762,6 +762,45 @@ async function runCodexTurn(envelope, relay, emit) {
 	const lastMsgFile = `/tmp/codex-last-${Date.now()}.txt`;
 	// Flags accepted by BOTH `exec` and `exec resume`.
 	const commonFlags = ['--json', '--ignore-user-config', '--skip-git-repo-check', '--output-last-message', lastMsgFile];
+
+	// MCP (streamable-HTTP): the Worker sends the SAME mcpConfig for codex as for
+	// claude ({mcpServers:{<name>:{type:'http',url,headers}}}), but codex reads MCP
+	// from CONFIG, not a --mcp-config file (claude's path). So translate each HTTP
+	// server into a `-c mcp_servers.<key>={url, env_http_headers}` override — the
+	// reliable form under --ignore-user-config, accepted by BOTH exec and resume
+	// (rides commonFlags). The header VALUE (the token) goes via ENV, never argv —
+	// same doctrine as CC (creds never on the command line / in logs). Before this,
+	// mcpConfig was silently dropped on codex: the Worker sent it, the codex adapter
+	// never wired it. (owner: "mcp não funciona no codex", 2026-08-01)
+	const mcpEnv = {};
+	const _mcpServers = envelope.mcpConfig && envelope.mcpConfig.mcpServers;
+	if (_mcpServers && typeof _mcpServers === 'object') {
+		const bareKey = (k) => /^[A-Za-z0-9_-]+$/.test(k) ? k : JSON.stringify(k);
+		let idx = 0;
+		for (const [name, s] of Object.entries(_mcpServers)) {
+			if (!s || !s.url) continue; // codex speaks HTTP MCP here; skip malformed
+			// codex config key: a bare TOML key. The unquoted `-c` dotted path is the
+			// only form the override parser reliably accepts (a hyphen/dot in the raw
+			// name breaks it), so sanitize. This is codex's INTERNAL server label only
+			// — tool names come from the server itself, so it never reaches tool ids.
+			const key = String(name).replace(/[^A-Za-z0-9_]/g, '_') || `mcp${idx}`;
+			const headers = (s.headers && typeof s.headers === 'object') ? s.headers : {};
+			const envMap = {};
+			for (const [h, v] of Object.entries(headers)) {
+				if (v == null) continue;
+				const ev = `MCP_HDR_${key}_${String(h).replace(/[^A-Za-z0-9_]/g, '_')}`.toUpperCase();
+				mcpEnv[ev] = String(v); // token lives in env, read by codex at connect
+				envMap[h] = ev;         // header name → env var to read
+			}
+			const parts = [`url=${JSON.stringify(s.url)}`];
+			if (Object.keys(envMap).length) {
+				parts.push(`env_http_headers={${Object.entries(envMap).map(([h, ev]) => `${bareKey(h)}=${JSON.stringify(ev)}`).join(', ')}}`);
+			}
+			commonFlags.push('-c', `mcp_servers.${key}={${parts.join(', ')}}`);
+			idx++;
+		}
+		if (idx) emit('phase', { name: 'codex_mcp', ts: nowMs(), servers: idx });
+	}
 	// Model + REASONING EFFORT — independent. A ChatGPT-account sub can't pick a
 	// model (OpenAI 400s every explicit id — only the account default works), so we
 	// OMIT -m there and drive the sole real knob, reasoning effort, via
@@ -798,7 +837,7 @@ async function runCodexTurn(envelope, relay, emit) {
 	// AUTH: sub (auth.json) wins over the static key. The sub is written to
 	// $CODEX_HOME/auth.json where the CLI reads it (and self-rotates it in place —
 	// the watcher below captures the rotation back, mirroring the CC credWatcher).
-	const codexEnv = { ...process.env, CODEX_HOME };
+	const codexEnv = { ...process.env, CODEX_HOME, ...mcpEnv };
 	if (envelope.codexAuth) {
 		try {
 			fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 });
