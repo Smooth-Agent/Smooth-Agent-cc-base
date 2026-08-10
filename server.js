@@ -1219,7 +1219,16 @@ function undoGit(args, cwd) {
 
 function ensureUndoRepo(cwd) {
 	const gitDir = path.join(cwd, UNDO_GITDIR);
-	if (!fs.existsSync(gitDir)) undoGit(['init', '-q'], cwd);
+	// A VALID git dir has objects/ AND refs/. A PARTIAL one (an init/commit whose writes
+	// weren't fsync'd to the volume before the box was destroyed → the volume kept only
+	// some files: HEAD/config but no objects/refs) would otherwise be reused forever —
+	// `existsSync(gitDir)` is true, so we'd skip init and every checkpoint would silently
+	// fail on the corrupt repo. Wipe + re-init clean whenever it doesn't look valid.
+	const valid = fs.existsSync(path.join(gitDir, 'objects')) && fs.existsSync(path.join(gitDir, 'refs'));
+	if (!valid) {
+		try { fs.rmSync(gitDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+		undoGit(['init', '-q'], cwd);
+	}
 	try {
 		fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
 		fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), UNDO_EXCLUDE);
@@ -1251,6 +1260,11 @@ function checkpointTurn(cwd, promptId) {
 	let patch = undoGit(['show', 'HEAD', '--no-color'], cwd).out;
 	const truncated = patch.length > UNDO_PATCH_MAX;
 	if (truncated) patch = patch.slice(0, UNDO_PATCH_MAX) + '\n... [patch truncated by smoothagent] ...\n';
+	// FLUSH to the durable volume: the box can be DESTROYED right after this turn (a
+	// base-cold next turn, or a Detona reap), and Detona's overlay is volume-backed —
+	// unsynced writes never reach the disk, so the .git-undo would land partial (empty
+	// HEAD, no objects → "not a git repository" next turn). fsync everything now.
+	try { spawnSync('sync', [], { timeout: 15000 }); } catch { /* best-effort */ }
 	return { commitSha, files, patch, truncated };
 }
 
