@@ -1196,12 +1196,7 @@ async function runSlotTurn(envelope, relay, emit) {
 // info/exclude, so we also never touch the user's .gitignore. See UNDO_CONTRACT.md.
 const UNDO_GITDIR = '.git-undo';
 const UNDO_EXCLUDE = [
-	// /workspace is the agent's HOME, so claude/codex rewrite their own state files
-	// (.claude.json session history, HOME dotfiles) every turn — pure noise in a diff.
-	// Exclude them so `changes` shows only the USER's work, not the engine's bookkeeping.
-	'.git', '.git-undo', '.claude', '.claude.json', '.claude*', '.codex', '.bashrc',
-	'.bash_logout', '.bash_history', '.profile', '.cache', '.config', '.npm', '.local',
-	'node_modules', 'bower_components',
+	'.git', '.git-undo', '.claude', '.codex', 'node_modules', 'bower_components',
 	'dist', 'build', 'out', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache',
 	'.venv', 'venv', '__pycache__', '.pytest_cache', 'target', 'vendor', 'coverage',
 	'*.log', '.DS_Store', '.env', '.env.*', 'tmp', '.gradle',
