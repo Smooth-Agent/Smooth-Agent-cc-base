@@ -94,14 +94,6 @@ class TurnRelay {
             // state — the Worker persists it (chats.slot_context) and returns it
             // as `context` on the next turn. Absent for cc-cli turns.
             ...(result && typeof result.context === 'string' ? { context: result.context } : {}),
-            // UNDO (per-turn time machine): the workspace git checkpoint of THIS
-            // turn — `changes` = {commitSha, files:[{path,status,additions,deletions}]}
-            // (small → the Worker rows it in D1), `patch` = the raw `git show` diff
-            // (large → the Worker offloads it to R2). Present only on undo-enabled
-            // real turns; the box computes it in the tail before this SAVE, so it
-            // never touches the user-perceived latency. See UNDO_CONTRACT.md.
-            ...(result && result.changes ? { changes: result.changes } : {}),
-            ...(result && typeof result.patch === 'string' ? { patch: result.patch } : {}),
           }),
         });
         outcome = { ok: r.ok, status: r.status, saved: true };

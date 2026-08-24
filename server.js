@@ -31,7 +31,7 @@
  */
 
 const http = require('node:http');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -1179,81 +1179,6 @@ async function runSlotTurn(envelope, relay, emit) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// UNDO CHECKPOINT — per-turn git snapshot of the workspace (the time machine).
-//
-// Engine-agnostic: git doesn't care whether claude or codex wrote the files. Runs
-// in the TAIL of a turn (after the engine finished, before relay.complete closes
-// the sink) → off the user-perceived latency; ~15ms with sane ignores (measured
-// on metal: a fat working tree is 584ms vs 6ms ignored — the one real cost lever).
-//
-// SHADOW GIT DIR (.git-undo): we NEVER use the workspace's own .git. If /workspace
-// is already the user's repo (SmoothBuilder drives their real git remote), our
-// per-turn commits must not pollute their branch/history. A separate GIT_DIR with
-// GIT_WORK_TREE=/workspace gives us an isolated checkpoint history; their .git is
-// untouched. Ignores (.git/.git-undo/node_modules/... AND .claude/.codex — the
-// OAuth creds live there and must NEVER be committed) go in the shadow repo's
-// info/exclude, so we also never touch the user's .gitignore. See UNDO_CONTRACT.md.
-const UNDO_GITDIR = '.git-undo';
-const UNDO_EXCLUDE = [
-	'.git', '.git-undo', '.claude', '.codex', 'node_modules', 'bower_components',
-	'dist', 'build', 'out', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache',
-	'.venv', 'venv', '__pycache__', '.pytest_cache', 'target', 'vendor', 'coverage',
-	'*.log', '.DS_Store', '.env', '.env.*', 'tmp', '.gradle',
-].join('\n') + '\n';
-const UNDO_PATCH_MAX = 1_048_576; // 1 MiB; larger diffs truncate (a marker is appended)
-
-function undoGit(args, cwd) {
-	const r = spawnSync('git', args, {
-		cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-		env: {
-			...process.env,
-			GIT_DIR: path.join(cwd, UNDO_GITDIR), GIT_WORK_TREE: cwd,
-			GIT_AUTHOR_NAME: 'smoothagent', GIT_AUTHOR_EMAIL: 'agent@smoothcodes',
-			GIT_COMMITTER_NAME: 'smoothagent', GIT_COMMITTER_EMAIL: 'agent@smoothcodes',
-			GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
-		},
-	});
-	return { code: r.status, out: r.stdout || '', err: r.stderr || '' };
-}
-
-function ensureUndoRepo(cwd) {
-	const gitDir = path.join(cwd, UNDO_GITDIR);
-	if (!fs.existsSync(gitDir)) undoGit(['init', '-q'], cwd);
-	try {
-		fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
-		fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), UNDO_EXCLUDE);
-	} catch { /* best-effort */ }
-	if (undoGit(['rev-parse', '--verify', '-q', 'HEAD'], cwd).code !== 0) {
-		undoGit(['add', '-A'], cwd);
-		undoGit(['commit', '-qm', 'undo:init', '--allow-empty'], cwd);
-	}
-}
-
-/** Commit the workspace as this turn's checkpoint. Returns {commitSha, files, patch, truncated}. */
-function checkpointTurn(cwd, promptId) {
-	ensureUndoRepo(cwd);
-	undoGit(['add', '-A'], cwd);
-	undoGit(['commit', '-qm', `turn:${promptId || 'anon'}`, '--allow-empty'], cwd);
-	const commitSha = undoGit(['rev-parse', 'HEAD'], cwd).out.trim();
-	const numstat = undoGit(['diff', '--numstat', 'HEAD~1', 'HEAD'], cwd).out.trim();
-	const nameStatus = undoGit(['diff', '--name-status', 'HEAD~1', 'HEAD'], cwd).out.trim();
-	const statusOf = {};
-	if (nameStatus) for (const line of nameStatus.split('\n')) {
-		const parts = line.split('\t');
-		statusOf[parts[parts.length - 1]] = parts[0][0]; // A / M / D / R
-	}
-	const files = numstat ? numstat.split('\n').filter(Boolean).map((line) => {
-		const [add, del, ...rest] = line.split('\t');
-		const p = rest.join('\t');
-		return { path: p, status: statusOf[p] || 'M', additions: add === '-' ? null : Number(add), deletions: del === '-' ? null : Number(del) };
-	}) : [];
-	let patch = undoGit(['show', 'HEAD', '--no-color'], cwd).out;
-	const truncated = patch.length > UNDO_PATCH_MAX;
-	if (truncated) patch = patch.slice(0, UNDO_PATCH_MAX) + '\n... [patch truncated by smoothagent] ...\n';
-	return { commitSha, files, patch, truncated };
-}
-
 const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// Open on purpose: static liveness for Detona's build/readiness probes.
@@ -1504,21 +1429,6 @@ const server = http.createServer(async (req, res) => {
 		// /stream still gets the whole turn replayed from its buffer until the
 		// next /run replaces it. Never let teardown throw.
 		if (credWatcherReport) { try { await credWatcherReport(); } catch {} }
-		// UNDO CHECKPOINT: snapshot the workspace BEFORE the SAVE, so `changes`/`patch`
-		// ride the same callback. Opt-in (envelope.undo), real agent turns only (never
-		// warmup/login/models/exec/build), and never an empty (no-answer) run. In the
-		// tail → off the user's latency path. Must never break the turn's save.
-		if (envelope.undo === true && (mode === 'cc-cli' || mode === 'slot')
-			&& relay.pendingResult && (relay.pendingResult.text || relay.pendingResult.usage)) {
-			try {
-				const ck = checkpointTurn(process.env.RUN_CWD || '/workspace', envelope.promptId);
-				if (ck) {
-					relay.pendingResult.changes = { commitSha: ck.commitSha, files: ck.files, truncated: ck.truncated };
-					relay.pendingResult.patch = ck.patch;
-					emit('phase', { name: 'undo_checkpoint', ts: nowMs(), sha: ck.commitSha.slice(0, 8), files: ck.files.length, truncated: ck.truncated });
-				}
-			} catch (e) { logError('undo checkpoint failed', { msg: e && e.message }); }
-		}
 		try {
 			const out = await relay.complete(relay.pendingResult || {});
 			if (out && out.ok === false) logError('save callback failed', { status: out.status, error: out.error });
