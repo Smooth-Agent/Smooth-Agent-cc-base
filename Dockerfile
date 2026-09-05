@@ -26,7 +26,7 @@ RUN apt-get update \
 
 # Claude Code CLI (official npm package).
 # Pinned via build arg so customers can rebuild against a known version.
-ARG CC_VERSION=latest
+ARG CC_VERSION=2.1.261
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VERSION}" \
  && npm cache clean --force
 
@@ -34,7 +34,7 @@ RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VE
 # (server.js runCodexTurn translates codex JSONL → claude stream-json), different
 # brain. Engines are OUR primitive and ship baked in the base; Detona layers stay
 # the CLIENT's primitive for their own customization.
-ARG CODEX_VERSION=latest
+ARG CODEX_VERSION=0.153.4
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
  && npm cache clean --force
 
