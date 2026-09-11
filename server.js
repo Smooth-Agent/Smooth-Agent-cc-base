@@ -817,7 +817,14 @@ async function runCodexTurn(envelope, relay, emit) {
 		// same full-access-in-the-microVM behavior as the fresh path below.
 		args = ['exec', 'resume', '--last', ...commonFlags, '--dangerously-bypass-approvals-and-sandbox'];
 		pushModel(args);
-		args.push(rawUserMessage(envelope.prompt));
+		// `--` ANTES do prompt: o texto do usuário é posicional, e clap trata qualquer
+		// coisa iniciada por '-' como flag → `codex exited 2: unexpected argument '- '`
+		// e o TURNO SOME (o usuário manda uma lista em markdown e não recebe nada).
+		// Visto em prod 2026-09-11, 2 turnos seguidos perdidos. O próprio codex sugere
+		// a saída no erro ("to pass '- ' as a value, use '-- - '"). Provado em metal que
+		// depois do `--` o texto vai pro [PROMPT] e NÃO pro [SESSION_ID] do resume
+		// (o thread_id do --last seguiu o mesmo). claude não precisa: prompt vai por stdin.
+		args.push('--', rawUserMessage(envelope.prompt));
 		emit('phase', { name: 'codex_resume', ts: nowMs() });
 	} else {
 		// fresh session. Fold prior context if present (cold box mid-chat with the
@@ -831,7 +838,8 @@ async function runCodexTurn(envelope, relay, emit) {
 		// --skip-git-repo-check because /workspace is not a git repo.
 		args = ['exec', ...commonFlags, '--sandbox', 'danger-full-access', '-C', RUN_CWD];
 		pushModel(args);
-		args.push(promptContent);
+		args.push('--', promptContent); // ver comentário no ramo de resume: prompt começando com '-' matava o turno
+
 	}
 
 	// AUTH: sub (auth.json) wins over the static key. The sub is written to
