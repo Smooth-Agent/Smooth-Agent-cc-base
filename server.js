@@ -872,6 +872,60 @@ async function runCodexTurn(envelope, relay, emit) {
 	let usage = null;
 	let sessionId = '';
 	const stderrTail = [];
+	// ── ADAPTER DE ITENS DO CODEX (2026-09-11) ──────────────────────────────────
+	// Antes so 3 tipos viravam evento (agent_message, reasoning, command_execution)
+	// e TODO o resto sumia em silencio — inclusive mcp_tool_call, que passou a
+	// existir de verdade quando o MCP voltou a funcionar no codex (fix do 202).
+	// Efeito pro usuario: o agente CHAMAVA a ferramenta e a UI nao mostrava nada
+	// (provado: turno respondeu "TOOLS=5" com ZERO eventos tool-call no stream).
+	// Tipos que o binario do codex conhece: agent_message, reasoning,
+	// command_execution, mcp_tool_call, patch_apply, file_change, web_search,
+	// todo_list. Extracao DEFENSIVA (cada campo tem candidatos) porque o schema do
+	// CLI muda entre versoes; e o que nao for reconhecido vira um phase com as
+	// CHAVES (nunca os valores) em vez de desaparecer.
+	const startedItems = new Set();
+	const TOOLISH = new Set(['command_execution', 'mcp_tool_call', 'web_search', 'patch_apply', 'file_change', 'todo_list']);
+	const KNOWN_EVENTS = new Set(['thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'item.started', 'item.completed', 'item.updated', 'error']);
+	const pick = (o, ...names) => { for (const n of names) { const v = o && o[n]; if (v != null && v !== '') return v; } return undefined; };
+	const toolNameOf = (it) => {
+		switch (it.type) {
+			case 'command_execution': return 'bash';
+			case 'mcp_tool_call': {
+				const srv = pick(it, 'server', 'server_name', 'serverLabel', 'server_label');
+				const tool = pick(it, 'tool', 'tool_name', 'name');
+				return srv && tool ? `mcp__${srv}__${tool}` : String(tool || srv || 'mcp_tool');
+			}
+			case 'web_search': return 'web_search';
+			case 'patch_apply': case 'file_change': return 'edit';
+			case 'todo_list': return 'todo';
+			default: return String(it.type || 'tool');
+		}
+	};
+	const toolInputOf = (it) => {
+		switch (it.type) {
+			case 'command_execution': return { command: String(pick(it, 'command', 'cmd') || '') };
+			case 'mcp_tool_call': return pick(it, 'arguments', 'args', 'input', 'params') ?? {};
+			case 'web_search': return { query: String(pick(it, 'query', 'q', 'search') || '') };
+			case 'patch_apply': case 'file_change': return { changes: pick(it, 'changes', 'files', 'path', 'diff') ?? {} };
+			case 'todo_list': return { items: pick(it, 'items', 'todos') ?? [] };
+			default: return {};
+		}
+	};
+	// ERRO de ferramenta: cobre as varias formas que o codex usa (status textual,
+	// campo error, exit_code != 0). O dono pediu erro visivel tanto do agente
+	// quanto das tools do usuario — este predicado e o que marca is_error.
+	const isErr = (it) => it.is_error === true || it.error != null
+		|| it.status === 'failed' || it.status === 'error'
+		|| (it.exit_code != null && it.exit_code !== 0);
+	const outputOf = (it) => {
+		const v = pick(it, 'aggregated_output', 'output', 'result', 'content', 'text', 'error', 'message');
+		return (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v)).slice(0, 2000);
+	};
+	const emitToolCall = (it) => {
+		const id = pick(it, 'id', 'item_id');
+		if (id != null) { if (startedItems.has(id)) return; startedItems.add(id); }
+		feed({ type: 'content_block_start', content_block: { type: 'tool_use', name: toolNameOf(it), input: toolInputOf(it) } });
+	};
 	proc.stdout.on('data', (chunk) => {
 		buf += chunk.toString('utf8');
 		let nl;
@@ -885,18 +939,30 @@ async function runCodexTurn(envelope, relay, emit) {
 			if (ev.type === 'thread.started' && ev.thread_id) sessionId = String(ev.thread_id);
 			if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') usage = ev.usage;
 			const item = ev.item && typeof ev.item === 'object' ? ev.item : null;
-			if (ev.type === 'item.completed' && item) {
+			if (ev.type === 'item.started' && item) {
+				if (TOOLISH.has(item.type)) emitToolCall(item);
+			} else if (ev.type === 'item.completed' && item) {
 				if (item.type === 'agent_message' && typeof item.text === 'string') {
 					finalText = item.text; // last agent_message wins (pre -o fallback)
 					feed({ type: 'content_block_delta', delta: { type: 'text_delta', text: item.text } });
 				} else if (item.type === 'reasoning' && typeof item.text === 'string') {
 					feed({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: item.text } });
-				} else if (item.type === 'command_execution') {
-					feed({ type: 'tool_result', name: 'bash', is_error: item.exit_code !== 0 && item.exit_code != null, content: String(item.aggregated_output || '').slice(0, 2000) });
+				} else if (TOOLISH.has(item.type)) {
+					// Garante o PAR call+result: item curto pode nunca emitir item.started,
+					// e resultado sem chamada aparece como resposta surgida do nada.
+					emitToolCall(item);
+					feed({ type: 'tool_result', name: toolNameOf(item), is_error: isErr(item), content: outputOf(item) });
+					if (item.type === 'patch_apply' || item.type === 'file_change') {
+						emit('phase', { name: 'file_changed', ts: nowMs(), tool: toolNameOf(item), error: isErr(item) });
+					}
+				} else {
+					// NADA some calado: tipo novo do CLI vira log com as CHAVES, sem valores.
+					emit('phase', { name: 'codex_item_unmapped', ts: nowMs(), item_type: String(item.type || '?'), keys: Object.keys(item).slice(0, 15) });
 				}
-			} else if (ev.type === 'item.started' && item && item.type === 'command_execution') {
-				feed({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'bash', input: { command: String(item.command || '') } } });
-			} else if (ev.type === 'error' || ev.type === 'turn.failed') {
+			} else if (!KNOWN_EVENTS.has(ev.type)) {
+				emit('phase', { name: 'codex_event_unmapped', ts: nowMs(), event_type: String(ev.type || '?') });
+			}
+			if (ev.type === 'error' || ev.type === 'turn.failed') {
 				const msg = (ev.error && (ev.error.message || ev.error)) || ev.message || 'codex error';
 				emit('error', { code: 'codex_failed', message: String(msg).slice(0, 500), retryable: false });
 			}
