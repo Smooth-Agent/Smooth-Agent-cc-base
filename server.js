@@ -921,11 +921,18 @@ async function runCodexTurn(envelope, relay, emit) {
 		const v = pick(it, 'aggregated_output', 'output', 'result', 'content', 'text', 'error', 'message');
 		return (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v)).slice(0, 2000);
 	};
+	// id do item vira o id do par call/result: sem ele a UI recebe a chamada e o
+	// resultado SOLTOS (toolCallId vazio no result) e nao consegue casar os dois.
+	const idOf = (it) => { const v = pick(it, 'id', 'item_id', 'call_id'); return v == null ? '' : String(v); };
 	const emitToolCall = (it) => {
-		const id = pick(it, 'id', 'item_id');
-		if (id != null) { if (startedItems.has(id)) return; startedItems.add(id); }
-		feed({ type: 'content_block_start', content_block: { type: 'tool_use', name: toolNameOf(it), input: toolInputOf(it) } });
+		const id = idOf(it);
+		if (id) { if (startedItems.has(id)) return; startedItems.add(id); }
+		feed({ type: 'content_block_start', content_block: { type: 'tool_use', id, name: toolNameOf(it), input: toolInputOf(it) } });
 	};
+	// Alguns itens so trazem os argumentos no item.completed (provado com
+	// mcp_tool_call: no started o input vinha vazio). Entao no started so emitimos
+	// quando ja ha input util; senao esperamos o completed, que emite o par.
+	const hasInput = (it) => { const i = toolInputOf(it); return !!i && Object.values(i).some((v) => v != null && v !== '' && !(Array.isArray(v) && !v.length) && !(typeof v === 'object' && v && !Array.isArray(v) && !Object.keys(v).length)); };
 	proc.stdout.on('data', (chunk) => {
 		buf += chunk.toString('utf8');
 		let nl;
@@ -940,7 +947,7 @@ async function runCodexTurn(envelope, relay, emit) {
 			if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') usage = ev.usage;
 			const item = ev.item && typeof ev.item === 'object' ? ev.item : null;
 			if (ev.type === 'item.started' && item) {
-				if (TOOLISH.has(item.type)) emitToolCall(item);
+				if (TOOLISH.has(item.type) && hasInput(item)) emitToolCall(item);
 			} else if (ev.type === 'item.completed' && item) {
 				if (item.type === 'agent_message' && typeof item.text === 'string') {
 					finalText = item.text; // last agent_message wins (pre -o fallback)
@@ -951,7 +958,7 @@ async function runCodexTurn(envelope, relay, emit) {
 					// Garante o PAR call+result: item curto pode nunca emitir item.started,
 					// e resultado sem chamada aparece como resposta surgida do nada.
 					emitToolCall(item);
-					feed({ type: 'tool_result', name: toolNameOf(item), is_error: isErr(item), content: outputOf(item) });
+					feed({ type: 'tool_result', id: idOf(item), name: toolNameOf(item), is_error: isErr(item), content: outputOf(item) });
 					if (item.type === 'patch_apply' || item.type === 'file_change') {
 						emit('phase', { name: 'file_changed', ts: nowMs(), tool: toolNameOf(item), error: isErr(item) });
 					}
