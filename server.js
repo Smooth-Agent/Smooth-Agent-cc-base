@@ -909,7 +909,7 @@ async function runCodexTurn(envelope, relay, emit) {
 		while (total > 65536 && stderrTail.length > 1) total -= stderrTail.shift().length;
 	});
 
-	proc.on('exit', (code) => {
+	proc.on('exit', async (code) => {
 		// --output-last-message is the AUTHORITATIVE final text — survives any
 		// schema drift in the --json events across codex versions.
 		try {
@@ -921,6 +921,16 @@ async function runCodexTurn(envelope, relay, emit) {
 			const tail = Buffer.concat(stderrTail).toString('utf8').slice(-512);
 			emit('error', { code: 'codex_exit', message: `codex exited ${code}${tail ? `\nstderr: ${tail}` : ''}`, retryable: false });
 		}
+		// FLUSH DA ROTAÇÃO DO CODEX — espelho do `await credWatcherReport()` do claude.
+		// O refresh token do sub é ROTATIVO DE USO ÚNICO: o codex refresha aqui dentro,
+		// reescreve auth.json e o token velho morre no servidor da OpenAI. O watcher só
+		// tinha o caminho do fs.watch com setTimeout(report,150) — e esses 150ms PERDEM
+		// a corrida contra o pauseAfter (a box congela quando o stream fecha) ou contra
+		// o destroy do one-shot. Resultado provado em prod: ZERO rotações capturadas,
+		// auth.json guardado parado desde 2026-08-06, e todo turno depois da primeira
+		// rotação morrendo com "refresh token was already used". Reportar ANTES de
+		// fechar o turno é o que torna a captura determinística.
+		if (codexAuthReport) { try { await codexAuthReport(); } catch { /* nunca derruba o turno */ } }
 		// claude-format result closes the turn: pendingResult (save callback) +
 		// the Worker translator's finish, exactly like a claude turn.
 		feed({
