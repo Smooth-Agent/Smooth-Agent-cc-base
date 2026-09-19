@@ -119,6 +119,15 @@ function nowMs() {
 // e sobrevive a setsid/nohup/reparenting e o AMBIENTE herdado: todo descendente do engine
 // carrega SMOOTH_TURN_ID=<nonce>; /proc/<pid>/environ e legivel porque tudo e o mesmo UID.
 // So `env -i` explicito fura — e ai a sessao e o cgroup (se um dia delegado) sao o fallback.
+// TRABALHO DENTRO DO PROCESSO DO ENGINE. Subagente do Claude Code em background nao e um
+// processo filho ate chamar uma tool: e uma promise dentro do claude, invisivel no /proc.
+// Provado em prod (chat_6ffcebd7c4d470d4, 09:09): result em 7s com "aguardando subagente",
+// zero processos, stream fechou, box pausou em 6s, o sleep do subagente congelou — o caso
+// original do tester. O sinal certo e do proprio Claude Code: `system/background_tasks_changed`
+// traz a LISTA de tarefas vivas (agentes e bash em background) e chega ANTES do result;
+// `[]` quando tudo acabou. Parse ACIMA do gate que descarta linhas pos-result.
+let claudeBgTasks = 0;       // tarefas em background que o Claude Code diz ter vivas
+let claudeBgTaskNames = [];
 const TURN_ENV = 'SMOOTH_TURN_ID';
 let engineTurnMark = null; // nonce do engine da vez (claude: por spawn; codex: por turno)
 function procHasTurnMark(pid) {
@@ -180,19 +189,19 @@ async function waitTurnQuiet(emit, maxMs) {
 	for (;;) {
 		const live = liveTurnProcs(engineSid, turnStartTicks, engineSid);
 		const waitedMs = nowMs() - t0;
-		if (!live.length) {
+		if (!live.length && claudeBgTasks === 0) {
 			if (seen) emit('phase', { name: 'background_done', ts: nowMs(), waited_ms: waitedMs });
 			return { waitedMs, left: [] };
 		}
 		seen = true;
 		if (waitedMs >= maxMs) {
-			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name) });
+			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: claudeBgTasks, taskNames: claudeBgTaskNames });
 			logError('turn left background work running (cap)', { waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => `${p.pid}:${p.name}`) });
 			return { waitedMs, left: live };
 		}
 		if (nowMs() - lastPhase >= 5000) {
 			lastPhase = nowMs();
-			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name) });
+			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: claudeBgTasks, taskNames: claudeBgTaskNames });
 		}
 		await new Promise((r) => setTimeout(r, 1000));
 	}
@@ -580,6 +589,7 @@ function spawnPersistentClaude(envelope) {
 			claudeTokenHash = null;
 			claudeAuthKind = null;
 			stdoutLineBuffer = '';
+			claudeBgTasks = 0; claudeBgTaskNames = [];
 		}
 	});
 
@@ -615,6 +625,20 @@ function handleClaudeStdout(chunk) {
 				const w = rid && controlWaiters.get(rid);
 				if (w) w(obj);
 			} catch { /* partial line — the waiter's timeout covers it */ }
+		}
+	}
+	// background_tasks_changed: pode chegar DEPOIS do result (turno ja resolvido) — e e
+	// exatamente ai que importa. Le antes do gate.
+	if (chunk.indexOf('background_tasks_changed') !== -1) {
+		for (const line of chunk.toString('utf8').split('\n')) {
+			if (line.indexOf('background_tasks_changed') === -1) continue;
+			try {
+				const obj = JSON.parse(line.trim());
+				if (obj.type === 'system' && obj.subtype === 'background_tasks_changed' && Array.isArray(obj.tasks)) {
+					claudeBgTasks = obj.tasks.length;
+					claudeBgTaskNames = obj.tasks.slice(0, 8).map((x) => String(x.description || x.task_type || x.task_id || '?'));
+				}
+			} catch { /* linha parcial */ }
 		}
 	}
 	if (!activeTurn) return;
@@ -978,6 +1002,7 @@ async function runCodexTurn(envelope, relay, emit) {
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	engineSid = proc.pid;
+	claudeBgTasks = 0; claudeBgTaskNames = []; // codex nao tem subagente
 	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
 
 	let buf = '';
