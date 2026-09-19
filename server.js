@@ -41,6 +41,7 @@ const PORT = 8080;
 const HOST = '0.0.0.0';
 
 let inFlight = false;
+let runsCompleted = 0; // 0 = este processo nunca fechou um turno = box COLD (nasceu da base agora)
 /** The current turn's relay (retain/send/save). GET /stream attaches to it. */
 let currentRelay = null;
 
@@ -884,6 +885,17 @@ async function runCodexTurn(envelope, relay, emit) {
 				try { return fs.statSync(path.join(sessionsDir, f)).isDirectory(); } catch { return false; }
 			})());
 	} catch { /* no sessions dir yet → fresh */ }
+	// BOX COLD NAO RESUME. O CODEX_HOME mora no VOLUME e o volume sobrevive a box: uma box
+	// que acabou de nascer da base ve o sessions/ da box ANTERIOR e tentava `resume --last`
+	// num processo que nunca teve aquela sessao — o turno voltava VAZIO (4s, 0 tokens, sem
+	// erro; provado em prod 2026-09-19, todo 1o turno apos agentRecycle). Cold = sessao nova
+	// com o historico refolded (o Worker ja manda o fold quando sabe que e cold). Golden e
+	// resume de pause restauram a RAM com runsCompleted >= 1, entao NAO caem aqui.
+	if (hasSession && runsCompleted === 0) {
+		emit('phase', { name: 'codex_cold_ignores_session', ts: nowMs() });
+		logInfo('codex: box cold — ignorando sessao do volume, sessao nova com fold');
+		hasSession = false;
+	}
 
 	// The RAW new message, even if the Worker pre-folded the transcript into the
 	// prompt (sentinel split): resume must NOT re-send the history codex already has.
@@ -1705,6 +1717,7 @@ const server = http.createServer(async (req, res) => {
 		// — so clearing the lock first is correct AND makes the freeze always catch
 		// the box idle. (This was the empty-2nd-message bug under pauseAfter.)
 		inFlight = false;
+		runsCompleted++;
 		lastRunAt = nowMs();
 		// SAVE + close: complete the relay — ends every sink (incl. this res) and
 		// fires the Worker callback to persist text+usage (the single D1 writer).
