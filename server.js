@@ -104,6 +104,29 @@ function nowMs() {
 //     deixa o idlePauseSeconds decidir.
 // Nenhum sandbox do mercado faz isto (Fly = conexoes do proxy, E2B = gap entre
 // comandos, Daytona = API): todos cegam pra trabalho em background.
+// CGROUP, nao sessao. A 1a versao (sha-f185b70) usava a SESSAO do engine — e o codex
+// roda a tool de shell com setsid proprio: o `sleep 40 &` do turno ficou fora da sessao,
+// o stream fechou, a box pausou e o sleep CONGELOU (provado em prod 2026-09-19, chat
+// chat_9b18d1fa94981237: sleep vivo com sid=641 != sid do codex). Sessao e furavel por
+// qualquer setsid/nohup — do engine ou do user. Cgroup nao: filho herda o cgroup do pai
+// SEMPRE, e reparenting nao muda. O engine entra em /sys/fs/cgroup/turn no spawn e todo
+// descendente (bash, subagente, curl, build) nasce la dentro. Provado no kernel do
+// Detona: `setsid nohup sleep 30 &` + pai sai -> segue em cgroup.procs, populated=1.
+// A sessao fica como FALLBACK se o cgroup nao estiver disponivel.
+const TURN_CG = '/sys/fs/cgroup/turn';
+let turnCgOk = false;
+try { fs.mkdirSync(TURN_CG, { recursive: true }); fs.accessSync(TURN_CG + '/cgroup.procs', fs.constants.W_OK); turnCgOk = true; }
+catch (e) { logError('turn cgroup indisponivel — cai pra sessao', { msg: e && e.message }); }
+/**
+ * Spawn do engine JA DENTRO do cgroup do turno. Mover o pid depois do spawn perdia a
+ * corrida: o sh forkava o filho antes do write em cgroup.procs (medido: sleep em 0::/).
+ * O wrapper entra no cgroup ANTES do exec, no mesmo pid — o engine nasce la dentro e
+ * todo descendente herda. Sem cgroup, spawn normal (fallback por sessao).
+ */
+function spawnInTurnCgroup(cmd, args, opts) {
+	if (!turnCgOk) return spawn(cmd, args, opts);
+	return spawn('/bin/sh', ['-c', `echo $$ > ${TURN_CG}/cgroup.procs 2>/dev/null; exec "$0" "$@"`, cmd, ...args], opts);
+}
 let engineSid = null;        // sessao (= pid) do engine da vez; claude persiste, codex e por turno
 let turnStartTicks = 0;      // /proc/uptime em ticks (USER_HZ=100) no run_received
 function uptimeTicks() {
@@ -112,17 +135,23 @@ function uptimeTicks() {
 /** Processos vivos (nao-zumbis) na sessao `sid`, nascidos apos `sinceTicks`, exceto `exceptPid`. */
 function liveTurnProcs(sid, sinceTicks, exceptPid) {
 	const out = [];
-	let dirs; try { dirs = fs.readdirSync('/proc'); } catch { return out; }
-	for (const d of dirs) {
-		if (!/^\d+$/.test(d)) continue;
-		const pid = Number(d);
+	// candidatos = quem esta no cgroup do turno (a verdade) U quem esta na sessao (fallback)
+	const cands = new Set();
+	_cgSet = new Set();
+	if (turnCgOk) { try { for (const l of fs.readFileSync(TURN_CG + '/cgroup.procs', 'utf8').split('\n')) { if (/^\d+$/.test(l)) { cands.add(Number(l)); _cgSet.add(Number(l)); } } } catch { /* fallback abaixo */ } }
+	let dirs = []; try { dirs = fs.readdirSync('/proc'); } catch { /* sem /proc: so o cgroup */ }
+	for (const d of dirs) if (/^\d+$/.test(d)) cands.add(Number(d));
+	for (const pid of cands) {
+		const d = String(pid);
 		if (pid === exceptPid || pid === process.pid) continue;
 		let stat; try { stat = fs.readFileSync(`/proc/${d}/stat`, 'utf8'); } catch { continue; }
 		const close = stat.lastIndexOf(')');
 		const name = stat.slice(stat.indexOf('(') + 1, close);
 		const f = stat.slice(close + 2).split(' '); // f[0]=state f[3]=session f[19]=starttime
 		if (f[0] === 'Z') continue;
-		if (Number(f[3]) !== sid) continue;
+		// esta no turno se: esta no cgroup do turno, OU (fallback) esta na sessao do engine
+		const inCg = turnCgOk && cgHas(pid);
+		if (!inCg && Number(f[3]) !== sid) continue;
 		// 2 ticks (20ms) de folga: starttime e /proc/uptime podem divergir em 1 tick na borda —
 		// contar um processo que nasceu 20ms antes do turno e inofensivo; deixar de contar o do turno nao.
 		if (Number(f[19]) < sinceTicks - 2) continue;
@@ -130,6 +159,8 @@ function liveTurnProcs(sid, sinceTicks, exceptPid) {
 	}
 	return out;
 }
+let _cgSet = new Set();
+function cgHas(pid) { return _cgSet.has(pid); }
 /** Segura o turno enquanto houver processo do turno vivo. Devolve o que sobrou no teto. */
 async function waitTurnQuiet(emit, maxMs) {
 	if (!engineSid) return { waitedMs: 0, left: [] };
@@ -488,7 +519,7 @@ async function killClaude(reason) {
  */
 function spawnPersistentClaude(envelope) {
 	const args = buildClaudeArgs(envelope);
-	const proc = spawn('claude', args, {
+	const proc = spawnInTurnCgroup('claude', args, {
 		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
 		cwd: process.env.RUN_CWD || '/workspace',
 		// API-key auth: the key rides the SPAWN env (claude reads ANTHROPIC_API_KEY
@@ -497,7 +528,7 @@ function spawnPersistentClaude(envelope) {
 		stdio: ['pipe', 'pipe', 'pipe'],
 	});
 	engineSid = proc.pid;
-	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length });
+	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length, turnCgroup: turnCgOk });
 
 	proc.stdout.on('data', handleClaudeStdout);
 
@@ -928,7 +959,7 @@ async function runCodexTurn(envelope, relay, emit) {
 		codexEnv.OPENAI_API_KEY = envelope.codexApiKey;
 	}
 	emit('phase', { name: 'codex_spawn', ts: nowMs(), auth: envelope.codexAuth ? 'sub' : 'key' });
-	const proc = spawn('codex', args, {
+	const proc = spawnInTurnCgroup('codex', args, {
 		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
 		cwd: process.env.RUN_CWD || '/workspace',
 		env: codexEnv,
