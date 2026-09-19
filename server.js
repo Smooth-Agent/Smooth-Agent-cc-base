@@ -89,6 +89,72 @@ function nowMs() {
 	return Date.now();
 }
 
+// ─── TURN = ATE O TRABALHO ACABAR (nao ate o CLI sair) ───────────────────────
+// O stream do /run e o que segura a box acordada: quando ele fecha, o Worker
+// pausa. Antes, ele fechava quando o CLI dizia "result" — e um `npm run build &`,
+// um subagente, um curl esperando resposta ficavam vivos e CONGELAVAM no pause
+// (caso real: chat_add755f9e469dd26, 2026-09-14 04:46). Quem sabe se o trabalho
+// acabou e a BOX, olhando a arvore de processos do turno:
+//   - o engine sobe com `detached:true` (= setsid): ele e todo descendente dele
+//     ficam na MESMA sessao, mesmo se o pai morrer e o filho for reparentado;
+//   - so contam processos que NASCERAM depois do inicio do turno (starttime do
+//     /proc), pra um helper persistente do claude nao segurar todo turno;
+//   - teto configuravel (envelope.backgroundWaitMs, default 10 min): estourou,
+//     a box avisa `background_left_running` e fecha — o Worker entao NAO pausa e
+//     deixa o idlePauseSeconds decidir.
+// Nenhum sandbox do mercado faz isto (Fly = conexoes do proxy, E2B = gap entre
+// comandos, Daytona = API): todos cegam pra trabalho em background.
+let engineSid = null;        // sessao (= pid) do engine da vez; claude persiste, codex e por turno
+let turnStartTicks = 0;      // /proc/uptime em ticks (USER_HZ=100) no run_received
+function uptimeTicks() {
+	try { return Math.floor(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]) * 100); } catch { return 0; }
+}
+/** Processos vivos (nao-zumbis) na sessao `sid`, nascidos apos `sinceTicks`, exceto `exceptPid`. */
+function liveTurnProcs(sid, sinceTicks, exceptPid) {
+	const out = [];
+	let dirs; try { dirs = fs.readdirSync('/proc'); } catch { return out; }
+	for (const d of dirs) {
+		if (!/^\d+$/.test(d)) continue;
+		const pid = Number(d);
+		if (pid === exceptPid || pid === process.pid) continue;
+		let stat; try { stat = fs.readFileSync(`/proc/${d}/stat`, 'utf8'); } catch { continue; }
+		const close = stat.lastIndexOf(')');
+		const name = stat.slice(stat.indexOf('(') + 1, close);
+		const f = stat.slice(close + 2).split(' '); // f[0]=state f[3]=session f[19]=starttime
+		if (f[0] === 'Z') continue;
+		if (Number(f[3]) !== sid) continue;
+		// 2 ticks (20ms) de folga: starttime e /proc/uptime podem divergir em 1 tick na borda —
+		// contar um processo que nasceu 20ms antes do turno e inofensivo; deixar de contar o do turno nao.
+		if (Number(f[19]) < sinceTicks - 2) continue;
+		out.push({ pid, name });
+	}
+	return out;
+}
+/** Segura o turno enquanto houver processo do turno vivo. Devolve o que sobrou no teto. */
+async function waitTurnQuiet(emit, maxMs) {
+	if (!engineSid) return { waitedMs: 0, left: [] };
+	const t0 = nowMs(); let lastPhase = 0; let seen = false;
+	for (;;) {
+		const live = liveTurnProcs(engineSid, turnStartTicks, engineSid);
+		const waitedMs = nowMs() - t0;
+		if (!live.length) {
+			if (seen) emit('phase', { name: 'background_done', ts: nowMs(), waited_ms: waitedMs });
+			return { waitedMs, left: [] };
+		}
+		seen = true;
+		if (waitedMs >= maxMs) {
+			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name) });
+			logError('turn left background work running (cap)', { waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => `${p.pid}:${p.name}`) });
+			return { waitedMs, left: live };
+		}
+		if (nowMs() - lastPhase >= 5000) {
+			lastPhase = nowMs();
+			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name) });
+		}
+		await new Promise((r) => setTimeout(r, 1000));
+	}
+}
+
 function logInfo(msg, extra = {}) {
 	// Stderr so it goes to Fly logs without polluting stdout (which is the SSE stream).
 	process.stderr.write(JSON.stringify({ ts: nowMs(), level: 'info', msg, ...extra }) + '\n');
@@ -423,12 +489,14 @@ async function killClaude(reason) {
 function spawnPersistentClaude(envelope) {
 	const args = buildClaudeArgs(envelope);
 	const proc = spawn('claude', args, {
+		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
 		cwd: process.env.RUN_CWD || '/workspace',
 		// API-key auth: the key rides the SPAWN env (claude reads ANTHROPIC_API_KEY
 		// natively) — never written to disk, never in .credentials.json.
 		env: envelope.ccApiKey ? { ...process.env, ANTHROPIC_API_KEY: envelope.ccApiKey } : process.env,
 		stdio: ['pipe', 'pipe', 'pipe'],
 	});
+	engineSid = proc.pid;
 	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length });
 
 	proc.stdout.on('data', handleClaudeStdout);
@@ -861,10 +929,12 @@ async function runCodexTurn(envelope, relay, emit) {
 	}
 	emit('phase', { name: 'codex_spawn', ts: nowMs(), auth: envelope.codexAuth ? 'sub' : 'key' });
 	const proc = spawn('codex', args, {
+		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
 		cwd: process.env.RUN_CWD || '/workspace',
 		env: codexEnv,
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
+	engineSid = proc.pid;
 	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
 
 	let buf = '';
@@ -1430,6 +1500,7 @@ const server = http.createServer(async (req, res) => {
 		// instrumentation. These are inner-container measurements that the
 		// translator forwards as 'phase' events for telemetry only.
 		const t_run_received = nowMs();
+		turnStartTicks = uptimeTicks();
 		emit('phase', { name: 'run_received', ts: t_run_received });
 
 		if (mode === 'cc-cli' && envelope.warmupOnly === true) {
@@ -1507,6 +1578,7 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
 			if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codexAuth (sub) or codexApiKey required for engine=codex');
 			await runCodexTurn(envelope, relay, emit);
+			await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
 		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
@@ -1524,6 +1596,7 @@ const server = http.createServer(async (req, res) => {
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
+			await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'slot' && envelope.warmupOnly === true) {
 			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
