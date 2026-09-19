@@ -1164,6 +1164,41 @@ function apiKeyMatches(req) {
 	return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// ─── USER STREAM TOKEN (direct user→box on GET /stream) ─────────────────────
+// The Worker mints a short Ed25519 token per turn so the END-USER can attach to
+// /stream DIRECTLY through the exposed URL (no Worker in the byte path). The box
+// only ever holds the PUBLIC key → harmless inside a golden fork. Both values
+// are REBOUND on every /run (SNAPSHOT TRAP: process globals freeze into forks;
+// a stale pubkey would reject every token after a key rotation).
+// The token opens ONLY GET /stream. /run keeps demanding the pinned x-api-key.
+let streamChatId = null;   // chatId of the current/last turn (token must match)
+let streamPubKey = null;   // Ed25519 SPKI DER (Buffer) or null = feature off
+function b64urlDecode(str) {
+	const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+	return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
+}
+/** Returns null when valid, else a short reason. */
+function userStreamTokenWhy(req) {
+	if (!streamPubKey) return 'no_pubkey';
+	let raw = '';
+	const authz = String(req.headers['authorization'] ?? '');
+	if (authz.startsWith('Bearer ')) raw = authz.slice(7).trim();
+	if (!raw) { const q = req.url.indexOf('?'); if (q >= 0) raw = new URLSearchParams(req.url.slice(q + 1)).get('token') || ''; }
+	if (!raw) return 'no_token';
+	const dot = raw.indexOf('.');
+	if (dot <= 0) return 'malformed';
+	let payloadBuf, sig, payload;
+	try { payloadBuf = b64urlDecode(raw.slice(0, dot)); sig = b64urlDecode(raw.slice(dot + 1)); payload = JSON.parse(payloadBuf.toString('utf8')); }
+	catch { return 'malformed'; }
+	if (!payload || typeof payload.c !== 'string' || typeof payload.e !== 'number') return 'malformed';
+	let ok = false;
+	try { ok = crypto.verify(null, payloadBuf, { key: streamPubKey, format: 'der', type: 'spki' }, sig); } catch { ok = false; }
+	if (!ok) return 'bad_sig';
+	if (payload.e <= Math.floor(Date.now() / 1000)) return 'expired';
+	if (!streamChatId || payload.c !== streamChatId) return 'wrong_chat';
+	return null;
+}
+
 // ─── SLOT RUNTIME (SLOT_CONTRACT.md, Fase 1 2026-07-11) ─────────────────────
 // The client's agent server: a PERSISTENT process speaking GET /ready +
 // POST /agent-run on localhost. Managed exactly like claude: spawned once,
@@ -1282,16 +1317,23 @@ const server = http.createServer(async (req, res) => {
 	// the whole turn). Once a key is pinned, demand it. Before any pin exists the
 	// box has nothing to protect (no turn ever ran) — /stream 204s below and
 	// POST /run performs the pinning.
+	// GET /stream is the ONE route a user stream token may open (direct user→box).
+	// Everything else (notably /run) still demands the pinned x-api-key.
+	const isStreamGet = req.method === 'GET' && (req.url === '/stream' || req.url.startsWith('/stream?'));
+	let userTokenWhy = null;
 	if (pinnedApiKey !== null && !apiKeyMatches(req)) {
-		res.writeHead(401, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ error: 'unauthorized' }));
-		return;
+		userTokenWhy = isStreamGet ? userStreamTokenWhy(req) : 'not_stream';
+		if (userTokenWhy !== null) {
+			res.writeHead(401, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify(isStreamGet ? { error: 'unauthorized', why: userTokenWhy } : { error: 'unauthorized' }));
+			return;
+		}
 	}
 
 	// F5 / reconnect: attach to the current turn's relay — replay everything
 	// buffered so far, then tail live. No active turn → 204, Worker reads D1.
 	// Agent-agnostic: works for any adapter that drives the relay.
-	if (req.method === 'GET' && req.url === '/stream') {
+	if (isStreamGet) {
 		if (!currentRelay) { res.writeHead(204).end(); return; }
 		res.writeHead(200, {
 			'Content-Type': 'application/x-ndjson',
@@ -1299,6 +1341,12 @@ const server = http.createServer(async (req, res) => {
 			'X-Accel-Buffering': 'no',
 		});
 		currentRelay.addSink(res);
+		// KEEPALIVE — /stream sinks only (never sink #0, the Worker's /run). The
+		// Detona expose path drops a connection after ~30s of silence; a thinking
+		// model can be quiet longer than that. One NDJSON line every 20s.
+		const ka = setInterval(() => { try { res.write(JSON.stringify({ type: 'ping' }) + '\n'); } catch { clearInterval(ka); } }, 20_000);
+		const stopKa = () => clearInterval(ka);
+		res.on('close', stopKa); res.on('error', stopKa); res.on('finish', stopKa);
 		return;
 	}
 
@@ -1346,6 +1394,10 @@ const server = http.createServer(async (req, res) => {
 	}
 
 	const mode = envelope.mode || 'cc-cli';
+
+	// REBIND the user-stream identity every turn (never trust the frozen global).
+	streamChatId = envelope.chatId || (envelope.workspaceProxy && envelope.workspaceProxy.chatId) || null;
+	streamPubKey = (typeof envelope.streamPubKey === 'string' && envelope.streamPubKey) ? Buffer.from(envelope.streamPubKey, 'base64') : null;
 
 	// Open streaming response. Chunked transfer encoding by default in Node.
 	res.writeHead(200, {
