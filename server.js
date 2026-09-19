@@ -1646,7 +1646,7 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
 			if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codexAuth (sub) or codexApiKey required for engine=codex');
 			await runCodexTurn(envelope, relay, emit);
-			await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
+			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000)).left.length;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
 		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
@@ -1664,7 +1664,7 @@ const server = http.createServer(async (req, res) => {
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
-			await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
+			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000)).left.length;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'slot' && envelope.warmupOnly === true) {
 			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
