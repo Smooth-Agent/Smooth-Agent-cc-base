@@ -113,6 +113,18 @@ function nowMs() {
 // descendente (bash, subagente, curl, build) nasce la dentro. Provado no kernel do
 // Detona: `setsid nohup sleep 30 &` + pai sai -> segue em cgroup.procs, populated=1.
 // A sessao fica como FALLBACK se o cgroup nao estiver disponivel.
+// MARCADOR DE AMBIENTE (o criterio primario). O server.js roda como UID 996 e o Detona
+// sobe o node direto, sem fase root: nao da pra criar/delegar cgroup de dentro (mkdir em
+// /sys/fs/cgroup falha — medido, turnCgOk=false em prod). O que NAO precisa de privilegio
+// e sobrevive a setsid/nohup/reparenting e o AMBIENTE herdado: todo descendente do engine
+// carrega SMOOTH_TURN_ID=<nonce>; /proc/<pid>/environ e legivel porque tudo e o mesmo UID.
+// So `env -i` explicito fura — e ai a sessao e o cgroup (se um dia delegado) sao o fallback.
+const TURN_ENV = 'SMOOTH_TURN_ID';
+let engineTurnMark = null; // nonce do engine da vez (claude: por spawn; codex: por turno)
+function procHasTurnMark(pid) {
+	if (!engineTurnMark) return false;
+	try { return fs.readFileSync(`/proc/${pid}/environ`).toString('latin1').split('\0').includes(`${TURN_ENV}=${engineTurnMark}`); } catch { return false; }
+}
 const TURN_CG = '/sys/fs/cgroup/turn';
 let turnCgOk = false;
 try { fs.mkdirSync(TURN_CG, { recursive: true }); fs.accessSync(TURN_CG + '/cgroup.procs', fs.constants.W_OK); turnCgOk = true; }
@@ -151,7 +163,7 @@ function liveTurnProcs(sid, sinceTicks, exceptPid) {
 		if (f[0] === 'Z') continue;
 		// esta no turno se: esta no cgroup do turno, OU (fallback) esta na sessao do engine
 		const inCg = turnCgOk && cgHas(pid);
-		if (!inCg && Number(f[3]) !== sid) continue;
+		if (!inCg && Number(f[3]) !== sid && !procHasTurnMark(pid)) continue;
 		// 2 ticks (20ms) de folga: starttime e /proc/uptime podem divergir em 1 tick na borda —
 		// contar um processo que nasceu 20ms antes do turno e inofensivo; deixar de contar o do turno nao.
 		if (Number(f[19]) < sinceTicks - 2) continue;
@@ -524,7 +536,7 @@ function spawnPersistentClaude(envelope) {
 		cwd: process.env.RUN_CWD || '/workspace',
 		// API-key auth: the key rides the SPAWN env (claude reads ANTHROPIC_API_KEY
 		// natively) — never written to disk, never in .credentials.json.
-		env: envelope.ccApiKey ? { ...process.env, ANTHROPIC_API_KEY: envelope.ccApiKey } : process.env,
+		env: { ...process.env, ...(envelope.ccApiKey ? { ANTHROPIC_API_KEY: envelope.ccApiKey } : {}), [TURN_ENV]: (engineTurnMark = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`) },
 		stdio: ['pipe', 'pipe', 'pipe'],
 	});
 	engineSid = proc.pid;
@@ -962,7 +974,7 @@ async function runCodexTurn(envelope, relay, emit) {
 	const proc = spawnInTurnCgroup('codex', args, {
 		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
 		cwd: process.env.RUN_CWD || '/workspace',
-		env: codexEnv,
+		env: { ...codexEnv, [TURN_ENV]: (engineTurnMark = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`) },
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	engineSid = proc.pid;
