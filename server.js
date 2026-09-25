@@ -436,6 +436,9 @@ function buildClaudeArgs(envelope) {
 		'--permission-mode', 'bypassPermissions',
 	];
 	if (envelope.model) args.push('--model', envelope.model);
+	// `--effort` e flag de SESSAO: entra no coreSignature, senao trocar de nivel
+	// reusaria o processo antigo e o user nao veria diferenca nenhuma.
+	if (envelope.ccEffort) args.push('--effort', String(envelope.ccEffort));
 	if (envelope.systemPrompt) args.push('--system-prompt', envelope.systemPrompt);
 	if (envelope.maxTurns) args.push('--max-turns', String(envelope.maxTurns));
 	if (envelope.mcpConfig) {
@@ -466,6 +469,7 @@ function coreSignature(envelope) {
 		engine: envelope.engine || 'claude',
 		systemPrompt: envelope.systemPrompt || null,
 		maxTurns: envelope.maxTurns || null,
+		ccEffort: envelope.ccEffort || null,
 		mcpConfig: envelope.mcpConfig || null,
 	});
 }
