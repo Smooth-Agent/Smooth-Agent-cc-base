@@ -54,6 +54,16 @@ let lastTurnCtx = null;               // turno anterior — recebe o 'until' qua
 let runsCompleted = 0; // 0 = este processo nunca fechou um turno = box COLD (nasceu da base agora)
 /** The current turn's relay (retain/send/save). GET /stream attaches to it. */
 let currentRelay = null;
+/** Relays dos turnos ABERTOS, em ordem de chegada (com a fila no adapter pode haver mais de
+ *  um: o que esta rodando + os que esperam a vez), e os ultimos fechados por promptId. */
+const openRelays = [];
+const doneRelays = new Map(); // promptId -> relay (so os 8 mais recentes)
+/** Relay pro reattach: o do promptId pedido; sem promptId, o turno mais ANTIGO ainda aberto
+ *  (= o que esta rodando), nao o ultimo que chegou (que pode estar so esperando a vez). */
+function relayFor(promptId) {
+	if (promptId) return openRelays.find((r) => r.promptId === promptId) || doneRelays.get(promptId) || null;
+	return openRelays[0] || currentRelay;
+}
 
 // ---------------------------------------------------------------------------
 // PERSISTENT CLAUDE PROCESS — the heart of the long-running optimization.
@@ -1503,13 +1513,16 @@ const server = http.createServer(async (req, res) => {
 	// buffered so far, then tail live. No active turn → 204, Worker reads D1.
 	// Agent-agnostic: works for any adapter that drives the relay.
 	if (isStreamGet) {
-		if (!currentRelay) { res.writeHead(204).end(); return; }
+		const q = req.url.indexOf('?');
+		const wantPrompt = q >= 0 ? new URLSearchParams(req.url.slice(q + 1)).get('promptId') : null;
+		const target = relayFor(wantPrompt);
+		if (!target) { res.writeHead(204).end(); return; }
 		res.writeHead(200, {
 			'Content-Type': 'application/x-ndjson',
 			'Cache-Control': 'no-cache, no-store',
 			'X-Accel-Buffering': 'no',
 		});
-		currentRelay.addSink(res);
+		target.addSink(res);
 		// KEEPALIVE — /stream sinks only (never sink #0, the Worker's /run). The
 		// Detona expose path drops a connection after ~30s of silence; a thinking
 		// model can be quiet longer than that. One NDJSON line every 20s.
@@ -1579,6 +1592,7 @@ const server = http.createServer(async (req, res) => {
 		callback: envelope.callback && envelope.callback.url ? envelope.callback : null,
 	});
 	currentRelay = relay;
+	openRelays.push(relay);
 	relay.addSink(res);
 
 	function emit(type, data) {
@@ -1775,6 +1789,8 @@ const server = http.createServer(async (req, res) => {
 		} catch (e) {
 			logError('relay.complete threw', { msg: e && e.message });
 		}
+		const at = openRelays.indexOf(relay); if (at >= 0) openRelays.splice(at, 1);
+		if (relay.promptId) { doneRelays.set(relay.promptId, relay); while (doneRelays.size > 8) doneRelays.delete(doneRelays.keys().next().value); }
 	}
 });
 
