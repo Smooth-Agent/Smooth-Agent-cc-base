@@ -32,4 +32,4 @@ jobs:
           file: Dockerfile.os
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/cc-os:${{ github.ref_name }}
+          tags: ghcr.io/smooth-agent/cc-os:${{ github.ref_name }}
