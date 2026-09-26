@@ -40,7 +40,17 @@ const { TurnRelay } = require('./relay');
 const PORT = 8080;
 const HOST = '0.0.0.0';
 
-let inFlight = false;
+// FILA NO ADAPTER (2026-09-26): a box ACEITA mensagem com turno rodando — antes era 409
+// 'already_running', a fila morava no Worker (teto de 175s) e, passado 3 min, o Worker
+// despachava direto, levava 409 e o retry DESTRUIA a box com o turno no meio. Agora cada
+// /run entra na fila do ENGINE: a mensagem 2 comeca assim que o engine termina a 1 (o
+// result do claude / o exit do codex) — nao espera trabalho em background, sem teto. E o
+// comportamento nativo dos dois: o Claude Code processa a mensagem seguinte depois do
+// result; o codex roda a proxima exec na mesma sessao.
+let openRuns = 0;                     // /run abertos (inclui os esperando a vez) — /health inFlight
+let engineChain = Promise.resolve();  // a vez do engine: cada turno espera o anterior liberar
+let engineBusy = false;               // um turno esta usando o engine agora
+let lastTurnCtx = null;               // turno anterior — recebe o 'until' quando o proximo comeca
 let runsCompleted = 0; // 0 = este processo nunca fechou um turno = box COLD (nasceu da base agora)
 /** The current turn's relay (retain/send/save). GET /stream attaches to it. */
 let currentRelay = null;
@@ -131,9 +141,9 @@ let claudeBgTasks = 0;       // tarefas em background que o Claude Code diz ter 
 let claudeBgTaskNames = [];
 const TURN_ENV = 'SMOOTH_TURN_ID';
 let engineTurnMark = null; // nonce do engine da vez (claude: por spawn; codex: por turno)
-function procHasTurnMark(pid) {
-	if (!engineTurnMark) return false;
-	try { return fs.readFileSync(`/proc/${pid}/environ`).toString('latin1').split('\0').includes(`${TURN_ENV}=${engineTurnMark}`); } catch { return false; }
+function procHasTurnMark(pid, mark) {
+	if (!mark) return false;
+	try { return fs.readFileSync(`/proc/${pid}/environ`).toString('latin1').split('\0').includes(`${TURN_ENV}=${mark}`); } catch { return false; }
 }
 const TURN_CG = '/sys/fs/cgroup/turn';
 let turnCgOk = false;
@@ -155,7 +165,7 @@ function uptimeTicks() {
 	try { return Math.floor(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]) * 100); } catch { return 0; }
 }
 /** Processos vivos (nao-zumbis) na sessao `sid`, nascidos apos `sinceTicks`, exceto `exceptPid`. */
-function liveTurnProcs(sid, sinceTicks, exceptPid) {
+function liveTurnProcs(sid, sinceTicks, exceptPid, mark, untilTicks) {
 	const out = [];
 	// candidatos = quem esta no cgroup do turno (a verdade) U quem esta na sessao (fallback)
 	const cands = new Set();
@@ -173,10 +183,12 @@ function liveTurnProcs(sid, sinceTicks, exceptPid) {
 		if (f[0] === 'Z') continue;
 		// esta no turno se: esta no cgroup do turno, OU (fallback) esta na sessao do engine
 		const inCg = turnCgOk && cgHas(pid);
-		if (!inCg && Number(f[3]) !== sid && !procHasTurnMark(pid)) continue;
+		if (!inCg && Number(f[3]) !== sid && !procHasTurnMark(pid, mark)) continue;
 		// 2 ticks (20ms) de folga: starttime e /proc/uptime podem divergir em 1 tick na borda —
 		// contar um processo que nasceu 20ms antes do turno e inofensivo; deixar de contar o do turno nao.
 		if (Number(f[19]) < sinceTicks - 2) continue;
+		// nasceu depois que o PROXIMO turno comecou = e trabalho do proximo, nao deste
+		if (untilTicks != null && Number(f[19]) >= untilTicks) continue;
 		out.push({ pid, name });
 	}
 	return out;
@@ -184,25 +196,28 @@ function liveTurnProcs(sid, sinceTicks, exceptPid) {
 let _cgSet = new Set();
 function cgHas(pid) { return _cgSet.has(pid); }
 /** Segura o turno enquanto houver processo do turno vivo. Devolve o que sobrou no teto. */
-async function waitTurnQuiet(emit, maxMs) {
-	if (!engineSid) return { waitedMs: 0, left: [] };
+async function waitTurnQuiet(emit, maxMs, ctx) {
+	if (!ctx || !ctx.sid) return { waitedMs: 0, left: [] };
 	const t0 = nowMs(); let lastPhase = 0; let seen = false;
 	for (;;) {
-		const live = liveTurnProcs(engineSid, turnStartTicks, engineSid);
+		const live = liveTurnProcs(ctx.sid, ctx.since, ctx.sid, ctx.mark, ctx.until);
+		// tarefas em background do Claude Code sao da SESSAO: quando o proximo turno ja comecou,
+		// elas seguem com ele — este turno nao espera por elas.
+		const bg = ctx.until == null ? claudeBgTasks : 0;
 		const waitedMs = nowMs() - t0;
-		if (!live.length && claudeBgTasks === 0) {
+		if (!live.length && bg === 0) {
 			if (seen) emit('phase', { name: 'background_done', ts: nowMs(), waited_ms: waitedMs });
 			return { waitedMs, left: [] };
 		}
 		seen = true;
 		if (waitedMs >= maxMs) {
-			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: claudeBgTasks, taskNames: claudeBgTaskNames });
+			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: claudeBgTaskNames });
 			logError('turn left background work running (cap)', { waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => `${p.pid}:${p.name}`) });
 			return { waitedMs, left: live };
 		}
 		if (nowMs() - lastPhase >= 5000) {
 			lastPhase = nowMs();
-			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: claudeBgTasks, taskNames: claudeBgTaskNames });
+			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: claudeBgTaskNames });
 		}
 		await new Promise((r) => setTimeout(r, 1000));
 	}
@@ -1463,7 +1478,7 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// Open on purpose: static liveness for Detona's build/readiness probes.
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ status: 'ok', inFlight }));
+		res.end(JSON.stringify({ status: 'ok', inFlight: openRuns > 0 }));
 		return;
 	}
 
@@ -1517,12 +1532,7 @@ const server = http.createServer(async (req, res) => {
 		else logInfo('auth pinned', { keyHash: tokenHash(pinnedApiKey) });
 	}
 
-	if (inFlight) {
-		res.writeHead(409, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ error: 'already_running' }));
-		return;
-	}
-	inFlight = true;
+	openRuns++;
 
 	// Read body (capped at 1 MiB).
 	const chunks = [];
@@ -1531,7 +1541,7 @@ const server = http.createServer(async (req, res) => {
 		bytes += chunk.length;
 		if (bytes > 1_048_576) {
 			res.writeHead(413).end();
-			inFlight = false;
+			openRuns--;
 			return;
 		}
 		chunks.push(chunk);
@@ -1543,7 +1553,7 @@ const server = http.createServer(async (req, res) => {
 	} catch (err) {
 		res.writeHead(400, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ error: 'invalid_json' }));
-		inFlight = false;
+		openRuns--;
 		return;
 	}
 
@@ -1578,13 +1588,27 @@ const server = http.createServer(async (req, res) => {
 	// Always emit a leading 'ready' event so client knows server is alive.
 	emit('ready', { mode, cwd: process.cwd() });
 
+	// A VEZ DO ENGINE (ver FILA NO ADAPTER). release() e idempotente e roda no ponto em que
+	// o engine terminou (antes da espera por background) ou, no pior caso, no finally.
+	const prevEngine = engineChain;
+	let releaseEngine = () => {};
+	engineChain = new Promise((r) => { releaseEngine = r; });
+	let engineReleased = false;
+	const release = () => { if (engineReleased) return; engineReleased = true; engineBusy = false; runsCompleted++; releaseEngine(); };
+	if (engineBusy) emit('phase', { name: 'queued_in_box', ts: nowMs() });
+	await prevEngine;
+	engineBusy = true;
+	// contexto do turno pra espera por background: janela [since, until) + sessao/marcador do engine
+	const turnCtx = { sid: null, mark: null, since: uptimeTicks(), until: null };
+	if (lastTurnCtx) lastTurnCtx.until = turnCtx.since;
+	lastTurnCtx = turnCtx;
+
 	// Dispatch.
 	try {
 		// Phase timestamps emitted as events for the worker-side benchmark
 		// instrumentation. These are inner-container measurements that the
 		// translator forwards as 'phase' events for telemetry only.
 		const t_run_received = nowMs();
-		turnStartTicks = uptimeTicks();
 		emit('phase', { name: 'run_received', ts: t_run_received });
 
 		if (mode === 'cc-cli' && envelope.warmupOnly === true) {
@@ -1662,7 +1686,9 @@ const server = http.createServer(async (req, res) => {
 			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
 			if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codexAuth (sub) or codexApiKey required for engine=codex');
 			await runCodexTurn(envelope, relay, emit);
-			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000)).left.length;
+			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark;
+			release(); // o engine terminou: a proxima mensagem ja pode rodar
+			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000, turnCtx)).left.length;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
 		} else if (mode === 'cc-cli') {
 			if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
@@ -1680,7 +1706,9 @@ const server = http.createServer(async (req, res) => {
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
-			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000)).left.length;
+			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark;
+			release(); // o engine terminou (result): a proxima mensagem ja pode rodar
+			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000, turnCtx)).left.length;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'slot' && envelope.warmupOnly === true) {
 			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
@@ -1720,8 +1748,8 @@ const server = http.createServer(async (req, res) => {
 		// done here — claude has finished; relay.complete is just persistence + close
 		// — so clearing the lock first is correct AND makes the freeze always catch
 		// the box idle. (This was the empty-2nd-message bug under pauseAfter.)
-		inFlight = false;
-		runsCompleted++;
+		openRuns--;
+		release();
 		lastRunAt = nowMs();
 		// SAVE + close: complete the relay — ends every sink (incl. this res) and
 		// fires the Worker callback to persist text+usage (the single D1 writer).
@@ -1778,7 +1806,7 @@ server.listen(PORT, HOST, () => {
 // idleTimeoutMs so the pool's stop() lands first under normal conditions.
 const IDLE_EXIT_MS = 35 * 60 * 1000;
 setInterval(() => {
-	if (inFlight) return;
+	if (openRuns > 0) return;
 	const idle = nowMs() - lastRunAt;
 	if (idle > IDLE_EXIT_MS) {
 		logError('idle for too long, exiting', { idleMs: idle });
@@ -1790,7 +1818,7 @@ setInterval(() => {
 // Graceful shutdown — let inflight finish.
 const onSig = (sig) => {
 	logInfo('signal received', { sig });
-	if (!inFlight) process.exit(0);
+	if (openRuns === 0) process.exit(0);
 };
 process.on('SIGTERM', onSig);
 process.on('SIGINT', onSig);
