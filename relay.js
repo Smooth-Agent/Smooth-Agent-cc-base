@@ -29,6 +29,9 @@ class TurnRelay {
     this.sinks = [];
     this.done = false;
     this.result = null;
+    /** ultimo byte escrito (heartbeat) e se o stream esta numa fronteira de linha */
+    this.lastWriteAt = Date.now();
+    this.aligned = true;
   }
 
   /** Attach a (re)connecting client: replay everything so far, then tail live. */
@@ -48,6 +51,9 @@ class TurnRelay {
   write(chunk) {
     if (this.done) return;
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    if (!buf.length) return;
+    this.lastWriteAt = Date.now();
+    this.aligned = buf[buf.length - 1] === 0x0a;
     this.buffer.push(buf);
     for (const res of this.sinks) {
       try { res.write(buf); } catch { /* drop dead sink; 'close' will prune it */ }

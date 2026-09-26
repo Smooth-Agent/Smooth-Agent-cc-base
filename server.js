@@ -91,7 +91,7 @@ let activeTurn = null;
 /** Rolling stdout buffer so we can split partial NDJSON lines across data chunks. */
 let stdoutLineBuffer = '';
 /** Time of last /run completion (for the idle-exit watchdog). */
-let lastRunAt = Date.now();
+let lastRunAt = Date.now(); // (so informativo desde que o idle watchdog saiu)
 // ---------------------------------------------------------------------------
 // R2 workspace sync subsystem REMOVED 2026-07-07 (was ~220 dead lines behind
 // `if (false && proxy)` — see git history). rclone left the image with it.
@@ -1588,6 +1588,16 @@ const server = http.createServer(async (req, res) => {
 	// Always emit a leading 'ready' event so client knows server is alive.
 	emit('ready', { mode, cwd: process.cwd() });
 
+	// HEARTBEAT do /run (2026-09-26). O Cloudflare derruba conexao ~100s SEM bytes (doc do
+	// Detona: "mande um heartbeat a cada <=30s"). Mensagem esperando a vez na fila e tool
+	// longa (build, deploy) ficam mudas — no chat_795256c4 a 2a mensagem caiu com "Network
+	// connection lost" 2 min depois de entrar na fila. So escreve em fronteira de linha
+	// (o claude manda chunks crus; um ping no meio de uma linha corromperia o NDJSON).
+	const heartbeat = setInterval(() => {
+		if (relay.done) return;
+		if (Date.now() - relay.lastWriteAt >= 20_000 && relay.aligned) emit('ping', {});
+	}, 5_000);
+
 	// A VEZ DO ENGINE (ver FILA NO ADAPTER). release() e idempotente e roda no ponto em que
 	// o engine terminou (antes da espera por background) ou, no pior caso, no finally.
 	const prevEngine = engineChain;
@@ -1751,6 +1761,7 @@ const server = http.createServer(async (req, res) => {
 		openRuns--;
 		release();
 		lastRunAt = nowMs();
+		clearInterval(heartbeat);
 		// SAVE + close: complete the relay — ends every sink (incl. this res) and
 		// fires the Worker callback to persist text+usage (the single D1 writer).
 		// Awaited so the ephemeral container never drops the save. currentRelay is
@@ -1799,21 +1810,9 @@ server.listen(PORT, HOST, () => {
 	logInfo('SmoothAgent runtime server listening', { port: PORT });
 });
 
-// Idle watchdog — defensive fallback. The Worker-side PoolManagerDO is the
-// primary mechanism that destroys idle Fly Machines, but in case it misses us
-// (DO restart, alarm drift, network blip) we self-exit after 35 minutes of
-// no /run traffic. This is slightly longer than the pool's default 30-min
-// idleTimeoutMs so the pool's stop() lands first under normal conditions.
-const IDLE_EXIT_MS = 35 * 60 * 1000;
-setInterval(() => {
-	if (openRuns > 0) return;
-	const idle = nowMs() - lastRunAt;
-	if (idle > IDLE_EXIT_MS) {
-		logError('idle for too long, exiting', { idleMs: idle });
-		if (claudeProc) { try { claudeProc.kill('SIGTERM'); } catch {} }
-		setTimeout(() => process.exit(2), 1000);
-	}
-}, 60_000);
+// (Idle watchdog de 35 min REMOVIDO 2026-09-26 — sobra da era Fly: numa box pausada ha
+// mais de 35 min o tick de 60s podia cair entre o resume e o /run e matar o server. Quem
+// pausa/destroi box e o Detona + o Worker.)
 
 // Graceful shutdown — let inflight finish.
 const onSig = (sig) => {
