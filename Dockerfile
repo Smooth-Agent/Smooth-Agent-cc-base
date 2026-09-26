@@ -9,20 +9,20 @@
 # Contract: see README.md and ENTRYPOINT.md
 # License: Apache-2.0
 
-FROM node:22-slim AS base
+# RUNTIME COMO LAYER (2026-09-26): esta imagem e o NOSSO runtime em cima da base
+# fixa `cc-os` (Dockerfile.os — SO, node, user 996, apt). No Detona ela NAO e
+# importada inteira: vira o layer `smooth-runtime` via
+#   PUT /v1/layers/smooth-runtime {"fromImage": "<esta imagem>", "base": "<template da cc-os>"}
+# e o Detona guarda so o DIFF (claude, codex, server.js...). Release = re-publicar
+# o mesmo nome; toda box converge no proximo acordar com /data intacto.
+# O OS_IMAGE tem que ser EXATAMENTE a imagem da base importada, senao o diff vira
+# "o sistema inteiro" e o Detona recusa.
+# Continua sendo uma imagem completa (FROM a base), entao `docker run` e o smoke
+# seguem funcionando igual.
+ARG OS_IMAGE=ghcr.io/smooth-agent/cc-os:os-v1
+FROM ${OS_IMAGE} AS base
 
-# Non-root user. uid/gid 996 matches host conventions for service users.
-RUN groupadd --system --gid 996 agent \
- && useradd  --system --uid 996 --gid agent \
-             --home-dir /workspace --shell /bin/bash --create-home agent
-
-# Minimal packages: ca-certs for HTTPS, curl + jq kept for the AGENT's own bash
-# tool calls (not for our boot path), git for repo work, tini as init for proper
-# signal handling on container teardown. (unzip removed with rclone, 2026-07-07.)
-RUN apt-get update \
- && apt-get install --yes --no-install-recommends \
-    ca-certificates curl jq tini git \
- && rm -rf /var/lib/apt/lists/*
+USER root
 
 # Claude Code CLI (official npm package).
 # Pinned via build arg so customers can rebuild against a known version.
