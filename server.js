@@ -1484,6 +1484,23 @@ async function runSlotTurn(envelope, relay, emit) {
 	}
 }
 
+// TURNO VIVO = BOX NAO OCIOSA (2026-09-27). O idle-pause do Detona (idlePauseSeconds=1800)
+// NAO enxerga turno: com run.http aberto ele marca busy:false e o idle segue contando ate um
+// exec pela API. Provado em prod: chat_795256c4, turno de build com a aba ABERTA e heartbeat
+// correndo, pausado aos 30:31 no meio de 107 tools (claude congelado). A box nao fala com o
+// Detona; avisa o Worker (mesmo JWT do callback do turno, 24h) e o Worker zera o idle.
+const ALIVE_EVERY_MS = 4 * 60 * 1000;
+setInterval(() => {
+	if (openRuns <= 0) return;
+	const r = openRelays[0] || currentRelay;
+	const cb = r && r.callback;
+	if (!cb || !cb.url) return;
+	const url = cb.url.replace(/\/internal\/chat-result$/, '/internal/turn-alive');
+	fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(cb.jwt ? { Authorization: `Bearer ${cb.jwt}` } : {}) }, body: JSON.stringify({ chatId: r.chatId, promptId: r.promptId }) })
+		.then((x) => { if (!x.ok) logError('turn-alive recusado', { status: x.status }); })
+		.catch((e) => logError('turn-alive falhou', { msg: e && e.message }));
+}, ALIVE_EVERY_MS);
+
 const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// Open on purpose: static liveness for Detona's build/readiness probes.
