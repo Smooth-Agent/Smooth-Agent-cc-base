@@ -98,6 +98,17 @@ let claudeTokenHash = null;
 let claudeAuthKind = null;
 /** Per-turn handler binding — null when no /run is in flight. */
 let activeTurn = null;
+// CONTINUACAO DO CLAUDE DEPOIS DO RESULT (2026-10-03). O Claude Code encerra a resposta
+// ("estou esperando o CI") com tarefas em background e, quando elas terminam
+// (task-notification), ACORDA SOZINHO e continua o trabalho — chamando MCP, sem processo
+// filho. Antes: (1) a box fechava o turno quando as tarefas zeravam, o Worker pausava e o
+// claude congelava NO MEIO da continuacao (chat_795256c4, 05:49); (2) tudo que o claude
+// escrevia depois do result era DESCARTADO (o "2o result"). Agora o turno fica "lingering"
+// ate o claude ficar ocioso: a continuacao vai pro relay do mesmo turno, o result dela
+// entra na resposta, e a proxima mensagem espera o claude ocioso.
+let lingerTurn = null;  // turno cujo result ja chegou, ainda aberto esperando o quieto
+let claudeBusy = false; // o claude esta no meio de uma resposta (user enviado ate o result)
+let claudeLastOut = 0;   // ultimo byte do claude — a task-notification chega uns ms DEPOIS da lista de tarefas zerar
 /** Rolling stdout buffer so we can split partial NDJSON lines across data chunks. */
 let stdoutLineBuffer = '';
 /** Time of last /run completion (for the idle-exit watchdog). */
@@ -213,7 +224,11 @@ async function waitTurnQuiet(emit, maxMs, ctx) {
 		const live = liveTurnProcs(ctx.sid, ctx.since, ctx.sid, ctx.mark, ctx.until);
 		// tarefas em background do Claude Code sao da SESSAO: quando o proximo turno ja comecou,
 		// elas seguem com ele — este turno nao espera por elas.
-		const bg = ctx.until == null ? claudeBgTasks : 0;
+		// A continuacao do claude (acordou com task-notification) e DESTE turno enquanto ele for
+		// o lingering — mesmo que a proxima mensagem ja tenha chegado (ela espera o claude ocioso).
+		const mine = ctx.engine === 'claude' && lingerTurn && lingerTurn.relay === ctx.relay;
+		const claudeWorking = mine && (claudeBusy || nowMs() - claudeLastOut < 1500);
+		const bg = (ctx.until == null ? claudeBgTasks : 0) + (claudeWorking ? 1 : 0);
 		const waitedMs = nowMs() - t0;
 		if (!live.length && bg === 0) {
 			if (seen) emit('phase', { name: 'background_done', ts: nowMs(), waited_ms: waitedMs });
@@ -619,7 +634,7 @@ function spawnPersistentClaude(envelope) {
 			claudeTokenHash = null;
 			claudeAuthKind = null;
 			stdoutLineBuffer = '';
-			claudeBgTasks = 0; claudeBgTaskNames = [];
+			claudeBgTasks = 0; claudeBgTaskNames = []; claudeBusy = false;
 		}
 	});
 
@@ -643,6 +658,7 @@ function spawnPersistentClaude(envelope) {
  * record them in /timing/cc.
  */
 function handleClaudeStdout(chunk) {
+	claudeLastOut = nowMs();
 	// control_response acks (e.g. set_model) can arrive BETWEEN turns — resolve
 	// waiters before the activeTurn gate or they'd be dropped and time out.
 	if (controlWaiters.size > 0) {
@@ -671,18 +687,20 @@ function handleClaudeStdout(chunk) {
 			} catch { /* linha parcial */ }
 		}
 	}
-	if (!activeTurn) return;
-	const t = activeTurn;
+	// Sem turno nenhum o parse SEGUE rodando: o estado do claude (ocupado/ocioso) tem que ser
+	// lido sempre, senao o result de uma continuacao sem dono deixa claudeBusy preso em true.
+	const t = activeTurn || lingerTurn;
 
-	// Phase: first stdout in this turn
-	if (!t.firstStdoutSeen) {
-		t.firstStdoutSeen = true;
-		t.emit('phase', { name: 'claude_first_stdout', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
+	if (t) {
+		// Phase: first stdout in this turn
+		if (!t.firstStdoutSeen) {
+			t.firstStdoutSeen = true;
+			t.emit('phase', { name: 'claude_first_stdout', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
+		}
+		// Forward raw chunk through the relay (buffers for F5 replay + fans out to
+		// every live sink — preserves frame alignment for the translator).
+		t.relay.write(chunk);
 	}
-
-	// Forward raw chunk through the relay (buffers for F5 replay + fans out to
-	// every live sink — preserves frame alignment for the translator).
-	t.relay.write(chunk);
 
 	// Parse line-by-line for terminal/phase detection.
 	stdoutLineBuffer += chunk.toString('utf8');
@@ -696,25 +714,38 @@ function handleClaudeStdout(chunk) {
 		if (!obj || typeof obj !== 'object') continue;
 		const type = obj.type;
 
-		if (!t.firstSystemSeen && type === 'system') {
+		if (t && !t.firstSystemSeen && type === 'system') {
 			t.firstSystemSeen = true;
 			t.emit('phase', { name: 'claude_first_system', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
 		}
-		if (!t.firstAssistantSeen && (type === 'assistant' || type === 'text' || type === 'content_block_start')) {
+		if (t && !t.firstAssistantSeen && (type === 'assistant' || type === 'text' || type === 'content_block_start')) {
 			t.firstAssistantSeen = true;
 			t.emit('phase', { name: 'claude_first_assistant', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
 		}
+		if (type === 'assistant' || type === 'stream_event' || type === 'user') claudeBusy = true;
 		if (type === 'result') {
-			// Claude finished. Capture the final text + usage for the SAVE
-			// callback, but don't complete the relay yet — sync_up + post_claude
-			// events still stream after this. complete() fires at end of /run.
-			const turn = activeTurn;
-			activeTurn = null;
-			turn.relay.pendingResult = {
-				text: typeof obj.result === 'string' ? obj.result : '',
-				usage: obj.usage || null,
-			};
-			turn.resolve();
+			claudeBusy = false;
+			if (activeTurn) {
+				// Claude finished. Capture the final text + usage for the SAVE
+				// callback, but don't complete the relay yet — sync_up + post_claude
+				// events still stream after this. complete() fires at end of /run.
+				const turn = activeTurn;
+				activeTurn = null;
+				turn.relay.pendingResult = {
+					text: typeof obj.result === 'string' ? obj.result : '',
+					usage: obj.usage || null,
+				};
+				lingerTurn = turn;
+				turn.resolve();
+			} else if (lingerTurn) {
+				// result da CONTINUACAO: soma na resposta do mesmo turno
+				const pr = lingerTurn.relay.pendingResult || { text: '', usage: null };
+				const more = typeof obj.result === 'string' ? obj.result : '';
+				pr.text = [pr.text, more].filter(Boolean).join('\n\n');
+				if (obj.usage) pr.usage = { input_tokens: ((pr.usage && pr.usage.input_tokens) || 0) + (obj.usage.input_tokens || 0), output_tokens: ((pr.usage && pr.usage.output_tokens) || 0) + (obj.usage.output_tokens || 0) };
+				lingerTurn.relay.pendingResult = pr;
+				lingerTurn.emit('phase', { name: 'claude_continuation_result', ts: nowMs(), chars: more.length });
+			}
 		}
 	}
 }
@@ -727,6 +758,16 @@ function handleClaudeStdout(chunk) {
  * where the time savings come from.
  */
 async function runPersistentClaude(envelope, relay, emit) {
+	// O claude pode estar CONTINUANDO o turno anterior (acordou com task-notification depois
+	// do result). Mandar a mensagem nova no meio faria o proximo result (o da continuacao)
+	// fechar ESTE turno com a resposta errada. Espera ele ficar ocioso (teto = o do background).
+	if (claudeProc && claudeProc.exitCode === null && claudeBusy) {
+		emit('phase', { name: 'waiting_claude_idle', ts: nowMs() });
+		const until = nowMs() + (envelope.backgroundWaitMs || 10 * 60 * 1000);
+		while (claudeBusy && claudeProc && claudeProc.exitCode === null && nowMs() < until) await new Promise((r) => setTimeout(r, 500));
+	}
+	// este turno assume o claude: o anterior deixa de ser dono da saida dele
+	lingerTurn = null;
 	const newCore = coreSignature(envelope);
 	const newModel = envelope.model || null;
 	// Auth kind: ccApiKey (static Anthropic API key → spawn env) beats the OAuth
@@ -851,6 +892,7 @@ async function runPersistentClaude(envelope, relay, emit) {
 	};
 	try {
 		claudeProc.stdin.write(JSON.stringify(userEvent) + '\n');
+		claudeBusy = true;
 	} catch (err) {
 		emit('error', { code: 'internal', message: `stdin write failed: ${err && err.message}`, retryable: true });
 		activeTurn = null;
@@ -1747,9 +1789,10 @@ const server = http.createServer(async (req, res) => {
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
 			await runPersistentClaude(envelope, relay, emit);
-			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark;
+			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark; turnCtx.engine = 'claude'; turnCtx.relay = relay;
 			release(); // o engine terminou (result): a proxima mensagem ja pode rodar
 			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000, turnCtx)).left.length;
+			if (lingerTurn && lingerTurn.relay === relay) lingerTurn = null;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'slot' && envelope.warmupOnly === true) {
 			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
