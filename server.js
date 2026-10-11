@@ -734,6 +734,10 @@ function handleClaudeStdout(chunk) {
 				turn.relay.pendingResult = {
 					text: typeof obj.result === 'string' ? obj.result : '',
 					usage: obj.usage || null,
+					// o turno TERMINOU EM ERRO (chave inválida, limite, API fora)? O texto aqui é a
+					// mensagem de erro, não fala do agente — o Worker salva como erro.
+					isError: obj.is_error === true,
+					subtype: typeof obj.subtype === 'string' ? obj.subtype : undefined,
 				};
 				lingerTurn = turn;
 				turn.resolve();

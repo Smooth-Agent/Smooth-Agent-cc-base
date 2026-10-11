@@ -96,6 +96,9 @@ class TurnRelay {
             promptId: this.promptId,
             text: (result && result.text) || '',
             usage: (result && result.usage) || null,
+            // turno terminou em ERRO do engine: o text é a mensagem de erro (o Worker salva como erro)
+            ...(result && result.isError ? { isError: true } : {}),
+            ...(result && typeof result.subtype === 'string' ? { subtype: result.subtype } : {}),
             // SLOT runtime (SLOT_CONTRACT.md): the slot's opaque conversation
             // state — the Worker persists it (chats.slot_context) and returns it
             // as `context` on the next turn. Absent for cc-cli turns.
