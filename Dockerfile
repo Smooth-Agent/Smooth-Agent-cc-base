@@ -34,7 +34,7 @@ RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VE
 # (server.js runCodexTurn translates codex JSONL → claude stream-json), different
 # brain. Engines are OUR primitive and ship baked in the base; Detona layers stay
 # the CLIENT's primitive for their own customization.
-ARG CODEX_VERSION=0.153.4
+ARG CODEX_VERSION=0.163.0
 RUN npm install --global --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
  && npm cache clean --force
 
