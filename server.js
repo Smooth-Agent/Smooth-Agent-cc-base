@@ -48,10 +48,59 @@ const HOST = '0.0.0.0';
 // comportamento nativo dos dois: o Claude Code processa a mensagem seguinte depois do
 // result; o codex roda a proxima exec na mesma sessao.
 let openRuns = 0;                     // /run abertos (inclui os esperando a vez) — /health inFlight
-let engineChain = Promise.resolve();  // a vez do engine: cada turno espera o anterior liberar
-let engineBusy = false;               // um turno esta usando o engine agora
-let lastTurnCtx = null;               // turno anterior — recebe o 'until' quando o proximo comeca
 let runsCompleted = 0; // 0 = este processo nunca fechou um turno = box COLD (nasceu da base agora)
+
+// ─── PISTAS (BOX COMPARTILHADA, core/BOX_SPEC.md, 2026-10-17) ────────────────────
+// Toda box e compartilhavel; a box de um chat e a box com UMA pista. Uma PISTA e o estado de
+// engine de um chat: o processo do claude dele, o turno ativo, a continuacao, a fila (a vez do
+// engine), o cwd e a pasta de credencial (claude e codex). Box propria (envelope sem
+// sharedBox) = a pista '_own' com os caminhos de SEMPRE — /workspace, ~/.claude,
+// /workspace/.codex — identica ao adapter de um chat so. Box compartilhada = uma pista por
+// chat: cwd /workspace/chats/<chat>, CLAUDE_CONFIG_DIR e CODEX_HOME proprios em
+// /workspace/.lanes/<chat> (as contas de cada agente nao se misturam e cada uma renova o
+// proprio token), e dois chats rodam ao mesmo tempo.
+const OWN_LANE = '_own';
+const lanes = new Map(); // key -> Lane
+class Lane {
+	constructor(key, shared) {
+		this.key = key;
+		this.shared = shared;
+		const base = shared ? path.join('/workspace/.lanes', key) : null;
+		this.cwd = shared ? path.join('/workspace/chats', key) : (process.env.RUN_CWD || '/workspace');
+		this.claudeConfigDir = shared ? path.join(base, 'claude') : null; // null = ~/.claude (box propria)
+		this.codexHome = shared ? path.join(base, 'codex') : (process.env.CODEX_HOME || '/workspace/.codex');
+		// processo do claude
+		this.proc = null; this.sig = null; this.model = null; this.tokenHash = null; this.authKind = null;
+		this.activeTurn = null; this.lingerTurn = null; this.busy = false; this.lastOut = 0; this.lineBuf = '';
+		this.bgTasks = 0; this.bgTaskNames = []; this.waiters = new Map();
+		this.sid = null; this.mark = null;
+		// sessao do Claude Code (pra voltar com --resume depois de uma rotacao por memoria)
+		this.sessionId = null; this.rotated = false;
+		// a vez do engine DESTA pista
+		this.chain = Promise.resolve(); this.engineBusy = false; this.lastTurnCtx = null; this.openRuns = 0;
+		this.lastUsed = Date.now();
+		// watchers de credencial (por pista: cada uma tem a propria conta)
+		this.cred = { callback: null, started: false, last: '', report: null };
+		this.cx = { callback: null, started: false, last: '', report: null };
+	}
+	get claudeDir() { return this.claudeConfigDir || path.join(process.env.HOME || '/workspace', '.claude'); }
+	get credFile() { return path.join(this.claudeDir, '.credentials.json'); }
+	get codexAuthFile() { return path.join(this.codexHome, 'auth.json'); }
+}
+/** A pista do envelope: chat de box compartilhada → a dele; senao a pista unica da box. */
+function laneFor(envelope) {
+	const chat = envelope && (envelope.chatId || (envelope.workspaceProxy && envelope.workspaceProxy.chatId));
+	const shared = !!(envelope && envelope.sharedBox === true && typeof chat === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(chat));
+	const key = shared ? chat : OWN_LANE;
+	let l = lanes.get(key);
+	if (!l) {
+		l = new Lane(key, shared);
+		if (shared) for (const d of [l.cwd, l.claudeConfigDir, l.codexHome]) { try { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); } catch { /* spawn falha com mensagem clara */ } }
+		lanes.set(key, l);
+	}
+	return l;
+}
+const ownLane = () => laneFor(null);
 /** The current turn's relay (retain/send/save). GET /stream attaches to it. */
 let currentRelay = null;
 /** Relays dos turnos ABERTOS, em ordem de chegada (com a fila no adapter pode haver mais de
@@ -60,9 +109,12 @@ const openRelays = [];
 const doneRelays = new Map(); // promptId -> relay (so os 8 mais recentes)
 /** Relay pro reattach: o do promptId pedido; sem promptId, o turno mais ANTIGO ainda aberto
  *  (= o que esta rodando), nao o ultimo que chegou (que pode estar so esperando a vez). */
-function relayFor(promptId) {
-	if (promptId) return openRelays.find((r) => r.promptId === promptId) || doneRelays.get(promptId) || null;
-	return openRelays[0] || currentRelay;
+// chatId: so turnos DAQUELE chat (box compartilhada: o reattach de um chat nunca pode cair no
+// turno de outro). Sem chatId = quem chama e o Worker (chave da box), que manda promptId.
+function relayFor(promptId, chatId) {
+	const mine = (r) => !chatId || r.chatId === chatId;
+	if (promptId) { const r = openRelays.find((x) => x.promptId === promptId) || doneRelays.get(promptId) || null; return r && mine(r) ? r : null; }
+	return openRelays.find(mine) || (currentRelay && mine(currentRelay) ? currentRelay : null);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,34 +135,21 @@ function relayFor(promptId) {
 // change, so it's swapped in place (.credentials.json rewritten, process kept).
 // ---------------------------------------------------------------------------
 
-/** Currently-running claude process. Null when no claude has been spawned (or it crashed/was killed). */
-let claudeProc = null;
-/** Core signature (systemPrompt+maxTurns+mcpConfig) the running claude was started with. */
-let claudeSig = null;
-/** Model the running claude is CURRENTLY on (spawn arg, or last in-flight set_model). */
-let claudeModel = null;
-/** Last ccToken written to .credentials.json. A new turn with a different token is
- *  swapped in place (credentials rewritten, process reused) — NOT a respawn. */
-let claudeTokenHash = null;
-/** How the running claude authenticates: 'oauth' (.credentials.json, self-rotating,
- *  watcher on) | 'apiKey' (ANTHROPIC_API_KEY spawn env — static, NO watcher, and a
- *  key change REQUIRES a respawn: env vars can't be swapped into a live process). */
-let claudeAuthKind = null;
-/** Per-turn handler binding — null when no /run is in flight. */
-let activeTurn = null;
+// ESTADO DO CLAUDE: vive na PISTA (Lane acima) — lane.proc (o processo), lane.sig (assinatura
+// systemPrompt+maxTurns+mcpConfig com que subiu), lane.model (modelo atual), lane.tokenHash
+// (ccToken gravado; token novo = troca no lugar, nao respawn), lane.authKind ('oauth' =
+// .credentials.json que se renova sozinho, com watcher | 'apiKey' = ANTHROPIC_API_KEY no env
+// do spawn, estatica, sem watcher, trocar a chave exige respawn), lane.activeTurn (o turno
+// do /run em andamento) e lane.lineBuf (linhas NDJSON parciais do stdout).
 // CONTINUACAO DO CLAUDE DEPOIS DO RESULT (2026-10-03). O Claude Code encerra a resposta
 // ("estou esperando o CI") com tarefas em background e, quando elas terminam
 // (task-notification), ACORDA SOZINHO e continua o trabalho — chamando MCP, sem processo
 // filho. Antes: (1) a box fechava o turno quando as tarefas zeravam, o Worker pausava e o
 // claude congelava NO MEIO da continuacao (chat_795256c4, 05:49); (2) tudo que o claude
 // escrevia depois do result era DESCARTADO (o "2o result"). Agora o turno fica "lingering"
-// ate o claude ficar ocioso: a continuacao vai pro relay do mesmo turno, o result dela
-// entra na resposta, e a proxima mensagem espera o claude ocioso.
-let lingerTurn = null;  // turno cujo result ja chegou, ainda aberto esperando o quieto
-let claudeBusy = false; // o claude esta no meio de uma resposta (user enviado ate o result)
-let claudeLastOut = 0;   // ultimo byte do claude — a task-notification chega uns ms DEPOIS da lista de tarefas zerar
-/** Rolling stdout buffer so we can split partial NDJSON lines across data chunks. */
-let stdoutLineBuffer = '';
+// (lane.lingerTurn) ate o claude ficar ocioso (lane.busy false e lane.lastOut ha 1.5s): a
+// continuacao vai pro relay do mesmo turno, o result dela entra na resposta, e a proxima
+// mensagem da pista espera o claude ocioso.
 /** Time of last /run completion (for the idle-exit watchdog). */
 let lastRunAt = Date.now(); // (so informativo desde que o idle watchdog saiu)
 // ---------------------------------------------------------------------------
@@ -158,10 +197,10 @@ function nowMs() {
 // original do tester. O sinal certo e do proprio Claude Code: `system/background_tasks_changed`
 // traz a LISTA de tarefas vivas (agentes e bash em background) e chega ANTES do result;
 // `[]` quando tudo acabou. Parse ACIMA do gate que descarta linhas pos-result.
-let claudeBgTasks = 0;       // tarefas em background que o Claude Code diz ter vivas
-let claudeBgTaskNames = [];
+// (lane.bgTasks / lane.bgTaskNames: tarefas em background que o Claude Code diz ter vivas)
 const TURN_ENV = 'SMOOTH_TURN_ID';
-let engineTurnMark = null; // nonce do engine da vez (claude: por spawn; codex: por turno)
+// lane.mark = nonce do engine da pista (claude: por spawn; codex: por turno)
+const newTurnMark = () => `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 function procHasTurnMark(pid, mark) {
 	if (!mark) return false;
 	try { return fs.readFileSync(`/proc/${pid}/environ`).toString('latin1').split('\0').includes(`${TURN_ENV}=${mark}`); } catch { return false; }
@@ -180,8 +219,7 @@ function spawnInTurnCgroup(cmd, args, opts) {
 	if (!turnCgOk) return spawn(cmd, args, opts);
 	return spawn('/bin/sh', ['-c', `echo $$ > ${TURN_CG}/cgroup.procs 2>/dev/null; exec "$0" "$@"`, cmd, ...args], opts);
 }
-let engineSid = null;        // sessao (= pid) do engine da vez; claude persiste, codex e por turno
-let turnStartTicks = 0;      // /proc/uptime em ticks (USER_HZ=100) no run_received
+// lane.sid = sessao (= pid) do engine da pista; claude persiste, codex e por turno
 function uptimeTicks() {
 	try { return Math.floor(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]) * 100); } catch { return 0; }
 }
@@ -202,8 +240,10 @@ function liveTurnProcs(sid, sinceTicks, exceptPid, mark, untilTicks) {
 		const name = stat.slice(stat.indexOf('(') + 1, close);
 		const f = stat.slice(close + 2).split(' '); // f[0]=state f[3]=session f[19]=starttime
 		if (f[0] === 'Z') continue;
-		// esta no turno se: esta no cgroup do turno, OU (fallback) esta na sessao do engine
-		const inCg = turnCgOk && cgHas(pid);
+		// esta no turno se: esta no cgroup do turno, OU (fallback) esta na sessao do engine.
+		// O cgroup e UM so pra box: com mais de uma pista ele nao diz de qual chat o processo e —
+		// ai so contam a sessao e o marcador de ambiente (que sao por pista).
+		const inCg = turnCgOk && lanes.size <= 1 && cgHas(pid);
 		if (!inCg && Number(f[3]) !== sid && !procHasTurnMark(pid, mark)) continue;
 		// 2 ticks (20ms) de folga: starttime e /proc/uptime podem divergir em 1 tick na borda —
 		// contar um processo que nasceu 20ms antes do turno e inofensivo; deixar de contar o do turno nao.
@@ -226,9 +266,10 @@ async function waitTurnQuiet(emit, maxMs, ctx) {
 		// elas seguem com ele — este turno nao espera por elas.
 		// A continuacao do claude (acordou com task-notification) e DESTE turno enquanto ele for
 		// o lingering — mesmo que a proxima mensagem ja tenha chegado (ela espera o claude ocioso).
-		const mine = ctx.engine === 'claude' && lingerTurn && lingerTurn.relay === ctx.relay;
-		const claudeWorking = mine && (claudeBusy || nowMs() - claudeLastOut < 1500);
-		const bg = (ctx.until == null ? claudeBgTasks : 0) + (claudeWorking ? 1 : 0);
+		const L = ctx.lane;
+		const mine = ctx.engine === 'claude' && L.lingerTurn && L.lingerTurn.relay === ctx.relay;
+		const claudeWorking = mine && (L.busy || nowMs() - L.lastOut < 1500);
+		const bg = (ctx.until == null ? L.bgTasks : 0) + (claudeWorking ? 1 : 0);
 		const waitedMs = nowMs() - t0;
 		if (!live.length && bg === 0) {
 			if (seen) emit('phase', { name: 'background_done', ts: nowMs(), waited_ms: waitedMs });
@@ -236,13 +277,13 @@ async function waitTurnQuiet(emit, maxMs, ctx) {
 		}
 		seen = true;
 		if (waitedMs >= maxMs) {
-			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: claudeBgTaskNames });
+			emit('phase', { name: 'background_left_running', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: L.bgTaskNames });
 			logError('turn left background work running (cap)', { waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => `${p.pid}:${p.name}`) });
 			return { waitedMs, left: live };
 		}
 		if (nowMs() - lastPhase >= 5000) {
 			lastPhase = nowMs();
-			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: claudeBgTaskNames });
+			emit('phase', { name: 'background_pending', ts: nowMs(), waited_ms: waitedMs, procs: live.length, names: live.slice(0, 8).map((p) => p.name), tasks: bg, taskNames: L.bgTaskNames });
 		}
 		await new Promise((r) => setTimeout(r, 1000));
 	}
@@ -270,9 +311,10 @@ function logError(msg, extra = {}) {
  * We keep /workspace/.claude/CLAUDE.md and other non-session config because
  * it's customer-authored project rules, not state.
  */
-function wipeClaudeState() {
+function wipeClaudeState(lane) {
 	// HOME for the `agent` user is /workspace (Dockerfile useradd --home-dir),
-	// so ~/.claude resolves into the persistent Fly Volume / tmpfs.
+	// so ~/.claude resolves into the persistent Fly Volume / tmpfs. (Pista de box
+	// compartilhada: o CLAUDE_CONFIG_DIR dela — lane.claudeDir.)
 	//
 	// PREVIOUSLY: this wiped the entire .claude dir. That fixed "Session ID X
 	// is already in use" but ALSO blew away anything Claude caches between
@@ -284,8 +326,7 @@ function wipeClaudeState() {
 	// stale OAuth token gets replaced — but the SDK-level session cache is
 	// preserved, which lets the second turn skip part of the Anthropic
 	// handshake.
-	const homeDir = process.env.HOME || '/workspace';
-	const projectsDir = path.join(homeDir, '.claude', 'projects');
+	const projectsDir = path.join(lane.claudeDir, 'projects');
 	try {
 		if (!fs.existsSync(projectsDir)) return;
 		// Walk projects/* and remove only sessions/ subdirs. Keeps project
@@ -311,12 +352,10 @@ function wipeClaudeState() {
  * self-refresh impossible and silently forced the platform into worker-side
  * rotation). expiresAt lets claude know when to rotate.
  */
-function configureCcAuth(token, refreshToken, expiresAt) {
-	const homeDir = process.env.HOME || '/workspace';
-	const ccDir = path.join(homeDir, '.claude');
-	fs.mkdirSync(ccDir, { recursive: true, mode: 0o700 });
+function configureCcAuth(lane, token, refreshToken, expiresAt) {
+	fs.mkdirSync(lane.claudeDir, { recursive: true, mode: 0o700 });
 	fs.writeFileSync(
-		CRED_FILE_PATH(),
+		lane.credFile,
 		JSON.stringify({
 			claudeAiOauth: {
 				accessToken: token,
@@ -327,23 +366,16 @@ function configureCcAuth(token, refreshToken, expiresAt) {
 		}),
 		{ mode: 0o600 },
 	);
-	credFileLastReported = credFileFingerprint();
-}
-
-function CRED_FILE_PATH() {
-	return path.join(process.env.HOME || '/workspace', '.claude', '.credentials.json');
+	lane.cred.last = credFileFingerprint(lane);
 }
 
 /** Cheap change detector for the credentials file (never logs contents). */
-function credFileFingerprint() {
+function credFileFingerprint(lane) {
 	try {
-		const raw = fs.readFileSync(CRED_FILE_PATH(), 'utf8');
+		const raw = fs.readFileSync(lane.credFile, 'utf8');
 		return crypto.createHash('sha256').update(raw).digest('hex');
 	} catch { return ''; }
 }
-
-let credFileLastReported = '';
-let credWatcherStarted = false;
 
 /**
  * CREDENTIAL WATCHER — the capture half of the doctrine. claude rotates the
@@ -363,20 +395,21 @@ let credWatcherStarted = false;
  * credWatcherCallback (module-level), and the report always reads the CURRENT
  * turn's jwt from there. Never capture callback params in this closure.
  */
-let credWatcherCallback = null;
-function startCredWatcher(callback) {
-	if (callback && callback.url) credWatcherCallback = callback; // rebind EVERY turn — see snapshot trap above
-	if (credWatcherStarted || !credWatcherCallback) return;
-	credWatcherStarted = true;
+// (lane.cred.callback = o callback do turno ATUAL da pista; lane.cred.last = fingerprint ja reportado)
+function startCredWatcher(lane, callback) {
+	const W = lane.cred;
+	if (callback && callback.url) W.callback = callback; // rebind EVERY turn — see snapshot trap above
+	if (W.started || !W.callback) return;
+	W.started = true;
 	const report = async () => {
 		try {
-			const cb = credWatcherCallback;
+			const cb = W.callback;
 			if (!cb || !cb.url) return;
-			const fp = credFileFingerprint();
-			if (!fp || fp === credFileLastReported) return;
-			const cred = JSON.parse(fs.readFileSync(CRED_FILE_PATH(), 'utf8')).claudeAiOauth || {};
+			const fp = credFileFingerprint(lane);
+			if (!fp || fp === W.last) return;
+			const cred = JSON.parse(fs.readFileSync(lane.credFile, 'utf8')).claudeAiOauth || {};
 			if (!cred.accessToken) return;
-			credFileLastReported = fp;
+			W.last = fp;
 			const url = cb.url.replace(/\/internal\/chat-result$/, '/internal/cc-credentials');
 			const r = await fetch(url, {
 				method: 'POST',
@@ -385,21 +418,20 @@ function startCredWatcher(callback) {
 			});
 			// A failed report must NOT be marked as reported — the post-turn sweep
 			// (next turn, fresh jwt) retries it. Losing a rotation kills the pair.
-			if (!r.ok) credFileLastReported = null;
-			logInfo('cred rotation reported', { status: r.status });
+			if (!r.ok) W.last = null;
+			logInfo('cred rotation reported', { status: r.status, lane: lane.key });
 		} catch (e) {
-			credFileLastReported = null; // retry on the next sweep
+			W.last = null; // retry on the next sweep
 			logError('cred report failed', { msg: e && e.message });
 		}
 	};
 	try {
-		fs.watch(path.dirname(CRED_FILE_PATH()), { persistent: false }, (_evt, fname) => {
+		fs.watch(lane.claudeDir, { persistent: false }, (_evt, fname) => {
 			if (fname === '.credentials.json') setTimeout(report, 150); // debounce partial writes
 		});
 	} catch (e) { logError('cred watcher failed to start', { msg: e && e.message }); }
-	credWatcherReport = report;
+	W.report = report;
 }
-let credWatcherReport = null;
 
 /**
  * API-key mode: static key, nothing EVER rotates — unbind the callback so a
@@ -407,8 +439,8 @@ let credWatcherReport = null;
  * The report closure re-reads credWatcherCallback at call time, so nulling it
  * here disarms reporting; the next oauth turn's startCredWatcher rebinds it.
  */
-function stopCredWatcher() {
-	credWatcherCallback = null;
+function stopCredWatcher(lane) {
+	lane.cred.callback = null;
 }
 
 // ─── CODEX SUB AUTH WATCHER (2026-07-26) ────────────────────────────────────
@@ -416,43 +448,41 @@ function stopCredWatcher() {
 // self-rotates $CODEX_HOME/auth.json in place (it IS the only rotator, same
 // doctrine); when it does, we mirror the new auth.json back to the Worker so
 // the stored sub never drifts stale. Reports to /internal/codex-credentials.
-let codexAuthCallback = null;
-let codexAuthWatcherStarted = false;
-let codexAuthLastReported = '';
-function codexAuthFingerprint() {
-	try { const s = fs.statSync(CODEX_AUTH_PATH()); return `${s.size}:${s.mtimeMs}`; } catch { return ''; }
+// (por pista: lane.cx = { callback, started, last, report } — cada pista tem o proprio CODEX_HOME)
+function codexAuthFingerprint(lane) {
+	try { const s = fs.statSync(lane.codexAuthFile); return `${s.size}:${s.mtimeMs}`; } catch { return ''; }
 }
-function startCodexAuthWatcher(callback) {
-	if (callback && callback.url) codexAuthCallback = callback; // rebind every turn (snapshot trap)
-	if (codexAuthWatcherStarted || !codexAuthCallback) return;
-	codexAuthWatcherStarted = true;
+function startCodexAuthWatcher(lane, callback) {
+	const W = lane.cx;
+	if (callback && callback.url) W.callback = callback; // rebind every turn (snapshot trap)
+	if (W.started || !W.callback) return;
+	W.started = true;
 	const report = async () => {
 		try {
-			const cb = codexAuthCallback;
+			const cb = W.callback;
 			if (!cb || !cb.url) return;
-			const fp = codexAuthFingerprint();
-			if (!fp || fp === codexAuthLastReported) return;
-			const raw = fs.readFileSync(CODEX_AUTH_PATH(), 'utf8');
+			const fp = codexAuthFingerprint(lane);
+			if (!fp || fp === W.last) return;
+			const raw = fs.readFileSync(lane.codexAuthFile, 'utf8');
 			if (!raw.trim()) return;
-			codexAuthLastReported = fp;
+			W.last = fp;
 			const url = cb.url.replace(/\/internal\/chat-result$/, '/internal/codex-credentials');
 			const r = await fetch(url, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json', ...(cb.jwt ? { Authorization: `Bearer ${cb.jwt}` } : {}) },
 				body: JSON.stringify({ authJson: raw }), // the full auth.json (never logged)
 			});
-			if (!r.ok) codexAuthLastReported = ''; // failed → retry next sweep
-			logInfo('codex auth rotation reported', { status: r.status });
-		} catch (e) { codexAuthLastReported = ''; logError('codex auth report failed', { msg: e && e.message }); }
+			if (!r.ok) W.last = ''; // failed → retry next sweep
+			logInfo('codex auth rotation reported', { status: r.status, lane: lane.key });
+		} catch (e) { W.last = ''; logError('codex auth report failed', { msg: e && e.message }); }
 	};
 	try {
-		fs.watch(CODEX_HOME, { persistent: false }, (_evt, fname) => {
+		fs.watch(lane.codexHome, { persistent: false }, (_evt, fname) => {
 			if (fname === 'auth.json') setTimeout(report, 150);
 		});
 	} catch (e) { logError('codex auth watcher failed to start', { msg: e && e.message }); }
-	codexAuthReport = report;
+	W.report = report;
 }
-let codexAuthReport = null;
 
 /**
  * Build claude argv for LONG-RUNNING mode (stream-json on stdin).
@@ -467,7 +497,7 @@ let codexAuthReport = null;
  *     "Session already in use".
  *   - --max-turns kept (it's an upper bound per user turn, not per session).
  */
-function buildClaudeArgs(envelope) {
+function buildClaudeArgs(envelope, resumeId) {
 	const args = [
 		'--output-format', 'stream-json',
 		'--input-format', 'stream-json',
@@ -475,6 +505,10 @@ function buildClaudeArgs(envelope) {
 		'--include-partial-messages',
 		'--permission-mode', 'bypassPermissions',
 	];
+	// ROTACAO (box compartilhada): o claude desta pista foi fechado por falta de memoria e
+	// volta na MESMA sessao do Claude Code (o arquivo dela mora no volume). Provado em metal
+	// 2026-10-14: processo novo com --resume em stream-json retoma o mesmo session_id.
+	if (resumeId) args.push('--resume', resumeId);
 	if (envelope.model) args.push('--model', envelope.model);
 	// `--effort` e flag de SESSAO: entra no coreSignature, senao trocar de nivel
 	// reusaria o processo antigo e o user nao veria diferenca nenhuma.
@@ -514,8 +548,7 @@ function coreSignature(envelope) {
 	});
 }
 
-/** Pending control_request acks (request_id → resolve). See trySetModel. */
-const controlWaiters = new Map();
+// (lane.waiters: control_request acks pendentes, request_id → resolve. Ver trySetModel.)
 
 /**
  * Ask the running claude to switch model in-flight (stream-json control channel).
@@ -523,22 +556,22 @@ const controlWaiters = new Map();
  * to the legacy kill+respawn, so an older CLI that ignores the subtype only costs
  * `timeoutMs` once per model switch, never correctness.
  */
-function trySetModel(model, timeoutMs) {
+function trySetModel(lane, model, timeoutMs) {
 	return new Promise((resolve) => {
-		if (!claudeProc || claudeProc.exitCode !== null) return resolve(false);
+		if (!lane.proc || lane.proc.exitCode !== null) return resolve(false);
 		const id = `sm_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-		const timer = setTimeout(() => { controlWaiters.delete(id); resolve(false); }, timeoutMs);
-		controlWaiters.set(id, (resp) => {
+		const timer = setTimeout(() => { lane.waiters.delete(id); resolve(false); }, timeoutMs);
+		lane.waiters.set(id, (resp) => {
 			clearTimeout(timer);
-			controlWaiters.delete(id);
+			lane.waiters.delete(id);
 			const sub = resp && resp.response ? resp.response.subtype : undefined;
 			resolve(sub === 'success' || (!!resp && !resp.error && sub !== 'error'));
 		});
 		try {
-			claudeProc.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'set_model', model } }) + '\n');
+			lane.proc.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'set_model', model } }) + '\n');
 		} catch {
 			clearTimeout(timer);
-			controlWaiters.delete(id);
+			lane.waiters.delete(id);
 			resolve(false);
 		}
 	});
@@ -560,16 +593,16 @@ function tokenHash(token) {
 }
 
 /** Send SIGTERM to the running claude and wait for it to exit. */
-async function killClaude(reason) {
-	if (!claudeProc) return;
-	logInfo('killing persistent claude', { reason, pid: claudeProc.pid });
-	const proc = claudeProc;
-	claudeProc = null;
-	claudeSig = null;
-	claudeModel = null;
-	claudeTokenHash = null;
-	claudeAuthKind = null;
-	stdoutLineBuffer = '';
+async function killClaude(lane, reason) {
+	if (!lane.proc) return;
+	logInfo('killing persistent claude', { reason, pid: lane.proc.pid, lane: lane.key });
+	const proc = lane.proc;
+	lane.proc = null;
+	lane.sig = null;
+	lane.model = null;
+	lane.tokenHash = null;
+	lane.authKind = null;
+	lane.lineBuf = '';
 	try { proc.kill('SIGTERM'); } catch { /* already dead */ }
 	await new Promise((resolve) => {
 		const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} resolve(); }, 3000);
@@ -583,20 +616,22 @@ async function killClaude(reason) {
  *
  * Returns the proc handle; also wires stdout to the streaming pipeline.
  */
-function spawnPersistentClaude(envelope) {
-	const args = buildClaudeArgs(envelope);
+function spawnPersistentClaude(lane, envelope, resumeId) {
+	const args = buildClaudeArgs(envelope, resumeId);
+	lane.mark = newTurnMark();
 	const proc = spawnInTurnCgroup('claude', args, {
 		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
-		cwd: process.env.RUN_CWD || '/workspace',
+		cwd: lane.cwd,
 		// API-key auth: the key rides the SPAWN env (claude reads ANTHROPIC_API_KEY
 		// natively) — never written to disk, never in .credentials.json.
-		env: { ...process.env, ...(envelope.ccApiKey ? { ANTHROPIC_API_KEY: envelope.ccApiKey } : {}), [TURN_ENV]: (engineTurnMark = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`) },
+		// Pista de box compartilhada: CLAUDE_CONFIG_DIR proprio (credencial + sessoes do chat).
+		env: { ...process.env, ...(lane.claudeConfigDir ? { CLAUDE_CONFIG_DIR: lane.claudeConfigDir } : {}), ...(envelope.ccApiKey ? { ANTHROPIC_API_KEY: envelope.ccApiKey } : {}), [TURN_ENV]: lane.mark },
 		stdio: ['pipe', 'pipe', 'pipe'],
 	});
-	engineSid = proc.pid;
-	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length, turnCgroup: turnCgOk });
+	lane.sid = proc.pid;
+	logInfo('persistent claude spawned', { pid: proc.pid, args: args.length, turnCgroup: turnCgOk, lane: lane.key, resumed: !!resumeId });
 
-	proc.stdout.on('data', handleClaudeStdout);
+	proc.stdout.on('data', (chunk) => handleClaudeStdout(lane, chunk));
 
 	const stderrTail = [];
 	proc.stderr.on('data', (chunk) => {
@@ -614,35 +649,37 @@ function spawnPersistentClaude(envelope) {
 	proc.on('exit', (code) => {
 		const tail = Buffer.concat(stderrTail).toString('utf8').slice(-1024);
 		logError('persistent claude exited', { code, stderrTail: tail.replace(/\n/g, ' | ') });
-		// If a turn was waiting on this process, surface the failure.
-		if (activeTurn) {
+		// If a turn was waiting on this process, surface the failure. (Uma rotacao por memoria
+		// so fecha pista OCIOSA — sem activeTurn — entao nunca cai aqui.)
+		if (lane.activeTurn && lane.proc === proc) {
+			const t = lane.activeTurn;
 			try {
-				activeTurn.emit('error', {
+				t.emit('error', {
 					code: 'exit_nonzero',
 					message: `claude exited ${code}${tail ? `\nstderr (tail): ${tail.slice(-512)}` : ''}`,
 					retryable: false,
 				});
-				activeTurn.resolve();
+				t.resolve();
 			} catch {}
-			activeTurn = null;
+			lane.activeTurn = null;
 		}
-		// Clear top-level state — next /run will respawn fresh.
-		if (claudeProc === proc) {
-			claudeProc = null;
-			claudeSig = null;
-			claudeModel = null;
-			claudeTokenHash = null;
-			claudeAuthKind = null;
-			stdoutLineBuffer = '';
-			claudeBgTasks = 0; claudeBgTaskNames = []; claudeBusy = false;
+		// Clear lane state — next /run will respawn fresh.
+		if (lane.proc === proc) {
+			lane.proc = null;
+			lane.sig = null;
+			lane.model = null;
+			lane.tokenHash = null;
+			lane.authKind = null;
+			lane.lineBuf = '';
+			lane.bgTasks = 0; lane.bgTaskNames = []; lane.busy = false;
 		}
 	});
 
-	claudeProc = proc;
-	claudeSig = coreSignature(envelope);
-	claudeModel = envelope.model || null;
-	claudeAuthKind = envelope.ccApiKey ? 'apiKey' : 'oauth';
-	claudeTokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
+	lane.proc = proc;
+	lane.sig = coreSignature(envelope);
+	lane.model = envelope.model || null;
+	lane.authKind = envelope.ccApiKey ? 'apiKey' : 'oauth';
+	lane.tokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
 	return proc;
 }
 
@@ -657,18 +694,19 @@ function spawnPersistentClaude(envelope) {
  * Phase markers are emitted as 'phase' events so the worker telemetry can
  * record them in /timing/cc.
  */
-function handleClaudeStdout(chunk) {
-	claudeLastOut = nowMs();
+function handleClaudeStdout(lane, chunk) {
+	lane.lastOut = nowMs();
+	lane.lastUsed = lane.lastOut;
 	// control_response acks (e.g. set_model) can arrive BETWEEN turns — resolve
 	// waiters before the activeTurn gate or they'd be dropped and time out.
-	if (controlWaiters.size > 0) {
+	if (lane.waiters.size > 0) {
 		for (const line of chunk.toString('utf8').split('\n')) {
 			const s = line.trim();
 			if (!s || s.indexOf('control_response') === -1) continue;
 			try {
 				const obj = JSON.parse(s);
 				const rid = (obj.response && obj.response.request_id) || obj.request_id;
-				const w = rid && controlWaiters.get(rid);
+				const w = rid && lane.waiters.get(rid);
 				if (w) w(obj);
 			} catch { /* partial line — the waiter's timeout covers it */ }
 		}
@@ -681,15 +719,15 @@ function handleClaudeStdout(chunk) {
 			try {
 				const obj = JSON.parse(line.trim());
 				if (obj.type === 'system' && obj.subtype === 'background_tasks_changed' && Array.isArray(obj.tasks)) {
-					claudeBgTasks = obj.tasks.length;
-					claudeBgTaskNames = obj.tasks.slice(0, 8).map((x) => String(x.description || x.task_type || x.task_id || '?'));
+					lane.bgTasks = obj.tasks.length;
+					lane.bgTaskNames = obj.tasks.slice(0, 8).map((x) => String(x.description || x.task_type || x.task_id || '?'));
 				}
 			} catch { /* linha parcial */ }
 		}
 	}
 	// Sem turno nenhum o parse SEGUE rodando: o estado do claude (ocupado/ocioso) tem que ser
-	// lido sempre, senao o result de uma continuacao sem dono deixa claudeBusy preso em true.
-	const t = activeTurn || lingerTurn;
+	// lido sempre, senao o result de uma continuacao sem dono deixa lane.busy preso em true.
+	const t = lane.activeTurn || lane.lingerTurn;
 
 	if (t) {
 		// Phase: first stdout in this turn
@@ -703,16 +741,20 @@ function handleClaudeStdout(chunk) {
 	}
 
 	// Parse line-by-line for terminal/phase detection.
-	stdoutLineBuffer += chunk.toString('utf8');
+	lane.lineBuf += chunk.toString('utf8');
 	let nl;
-	while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
-		const line = stdoutLineBuffer.slice(0, nl).trim();
-		stdoutLineBuffer = stdoutLineBuffer.slice(nl + 1);
+	while ((nl = lane.lineBuf.indexOf('\n')) >= 0) {
+		const line = lane.lineBuf.slice(0, nl).trim();
+		lane.lineBuf = lane.lineBuf.slice(nl + 1);
 		if (!line) continue;
 		let obj;
 		try { obj = JSON.parse(line); } catch { continue; }
 		if (!obj || typeof obj !== 'object') continue;
 		const type = obj.type;
+		// sessao do Claude Code desta pista (system/init e result trazem) — e por ela que a pista
+		// volta com --resume depois de uma rotacao por memoria
+		// (so do claude: o codex passa por aqui via feed() com o thread_id DELE no session_id)
+		if (lane.proc && (type === 'system' || type === 'result') && typeof obj.session_id === 'string' && obj.session_id) lane.sessionId = obj.session_id;
 
 		if (t && !t.firstSystemSeen && type === 'system') {
 			t.firstSystemSeen = true;
@@ -722,15 +764,15 @@ function handleClaudeStdout(chunk) {
 			t.firstAssistantSeen = true;
 			t.emit('phase', { name: 'claude_first_assistant', ts: nowMs(), since_spawn_call_ms: nowMs() - t.t_spawn });
 		}
-		if (type === 'assistant' || type === 'stream_event' || type === 'user') claudeBusy = true;
+		if (type === 'assistant' || type === 'stream_event' || type === 'user') lane.busy = true;
 		if (type === 'result') {
-			claudeBusy = false;
-			if (activeTurn) {
+			lane.busy = false;
+			if (lane.activeTurn) {
 				// Claude finished. Capture the final text + usage for the SAVE
 				// callback, but don't complete the relay yet — sync_up + post_claude
 				// events still stream after this. complete() fires at end of /run.
-				const turn = activeTurn;
-				activeTurn = null;
+				const turn = lane.activeTurn;
+				lane.activeTurn = null;
 				turn.relay.pendingResult = {
 					text: typeof obj.result === 'string' ? obj.result : '',
 					usage: obj.usage || null,
@@ -739,39 +781,83 @@ function handleClaudeStdout(chunk) {
 					isError: obj.is_error === true,
 					subtype: typeof obj.subtype === 'string' ? obj.subtype : undefined,
 				};
-				lingerTurn = turn;
+				lane.lingerTurn = turn;
 				turn.resolve();
-			} else if (lingerTurn) {
+			} else if (lane.lingerTurn) {
 				// result da CONTINUACAO: soma na resposta do mesmo turno
-				const pr = lingerTurn.relay.pendingResult || { text: '', usage: null };
+				const lt = lane.lingerTurn;
+				const pr = lt.relay.pendingResult || { text: '', usage: null };
 				const more = typeof obj.result === 'string' ? obj.result : '';
 				pr.text = [pr.text, more].filter(Boolean).join('\n\n');
 				if (obj.usage) pr.usage = { input_tokens: ((pr.usage && pr.usage.input_tokens) || 0) + (obj.usage.input_tokens || 0), output_tokens: ((pr.usage && pr.usage.output_tokens) || 0) + (obj.usage.output_tokens || 0) };
-				lingerTurn.relay.pendingResult = pr;
-				lingerTurn.emit('phase', { name: 'claude_continuation_result', ts: nowMs(), chars: more.length });
+				lt.relay.pendingResult = pr;
+				lt.emit('phase', { name: 'claude_continuation_result', ts: nowMs(), chars: more.length });
 			}
 		}
 	}
 }
 
+// ROTACAO POR MEMORIA (BOX_SPEC, 2026-10-17). So existe com mais de uma pista (box compartilhada):
+// antes de subir um claude, a box confere a RAM livre; faltando, fecha o claude da pista OCIOSA
+// usada ha mais tempo (LRU) — ela volta depois pelo --resume da sessao dela. Sem ociosa pra
+// fechar, o turno ESPERA a vez (com ping no stream), nunca arrisca matar a box por falta de
+// memoria. Box de um chat: nada disso roda (a pausa ja libera a RAM, como sempre).
+const LANE_SPAWN_MB = Number(process.env.SMOOTH_LANE_SPAWN_MB) || 300;
+const MEMINFO_PATH = process.env.SMOOTH_MEMINFO_PATH || '/proc/meminfo'; // trocavel so pra teste
+function memAvailableMb() {
+	try {
+		const m = fs.readFileSync(MEMINFO_PATH, 'utf8').match(/^MemAvailable:\s+(\d+)\s+kB/m);
+		return m ? Math.floor(Number(m[1]) / 1024) : Infinity;
+	} catch { return Infinity; }
+}
+function laneIdle(l) { return !!l.proc && !l.activeTurn && !l.lingerTurn && !l.busy && l.openRuns === 0 && !l.engineBusy; }
+async function reserveMemoryFor(lane, emit, maxWaitMs) {
+	if (lanes.size <= 1) return;
+	const t0 = nowMs(); let lastPhase = 0;
+	for (;;) {
+		const avail = memAvailableMb();
+		if (avail >= LANE_SPAWN_MB) return;
+		const victim = [...lanes.values()].filter((l) => l !== lane && laneIdle(l)).sort((a, b) => a.lastUsed - b.lastUsed)[0];
+		if (victim) {
+			emit('phase', { name: 'lane_rotated', ts: nowMs(), lane: victim.key, avail_mb: avail });
+			victim.rotated = true;
+			await killClaude(victim, 'memory_rotation');
+			// respiro antes de medir de novo: a RAM do processo fechado nao aparece livre no mesmo
+			// instante — medir na hora fechava uma pista A MAIS do que o necessario (provado no teste)
+			await new Promise((r) => setTimeout(r, 700));
+			continue;
+		}
+		if (nowMs() - t0 >= maxWaitMs) { emit('phase', { name: 'memory_wait_gave_up', ts: nowMs(), avail_mb: avail }); return; }
+		if (nowMs() - lastPhase >= 5000) { lastPhase = nowMs(); emit('phase', { name: 'waiting_memory', ts: nowMs(), avail_mb: avail, need_mb: LANE_SPAWN_MB }); }
+		await new Promise((r) => setTimeout(r, 1000));
+	}
+}
+/** A sessao do Claude Code desta pista ainda esta no disco? (--resume de sessao sumida = erro) */
+function laneSessionOnDisk(lane) {
+	if (!lane.sessionId) return false;
+	const root = path.join(lane.claudeDir, 'projects');
+	try { for (const p of fs.readdirSync(root)) if (fs.existsSync(path.join(root, p, `${lane.sessionId}.jsonl`))) return true; } catch { /* sem projects */ }
+	return false;
+}
+
 /**
- * Drive one /run against the persistent claude process.
+ * Drive one /run against the persistent claude process OF THIS LANE.
  *
  * Spawns claude if it's not running OR if the session args / token have
  * changed since last turn. Otherwise reuses the existing process — that's
  * where the time savings come from.
  */
-async function runPersistentClaude(envelope, relay, emit) {
+async function runPersistentClaude(lane, envelope, relay, emit) {
 	// O claude pode estar CONTINUANDO o turno anterior (acordou com task-notification depois
 	// do result). Mandar a mensagem nova no meio faria o proximo result (o da continuacao)
 	// fechar ESTE turno com a resposta errada. Espera ele ficar ocioso (teto = o do background).
-	if (claudeProc && claudeProc.exitCode === null && claudeBusy) {
+	if (lane.proc && lane.proc.exitCode === null && lane.busy) {
 		emit('phase', { name: 'waiting_claude_idle', ts: nowMs() });
 		const until = nowMs() + (envelope.backgroundWaitMs || 10 * 60 * 1000);
-		while (claudeBusy && claudeProc && claudeProc.exitCode === null && nowMs() < until) await new Promise((r) => setTimeout(r, 500));
+		while (lane.busy && lane.proc && lane.proc.exitCode === null && nowMs() < until) await new Promise((r) => setTimeout(r, 500));
 	}
 	// este turno assume o claude: o anterior deixa de ser dono da saida dele
-	lingerTurn = null;
+	lane.lingerTurn = null;
 	const newCore = coreSignature(envelope);
 	const newModel = envelope.model || null;
 	// Auth kind: ccApiKey (static Anthropic API key → spawn env) beats the OAuth
@@ -786,13 +872,13 @@ async function runPersistentClaude(envelope, relay, emit) {
 	// mismatch below falls through to the legacy respawn. Worst case = one 2s
 	// timeout per switch; best case kills the model-switch respawn entirely.
 	if (
-		claudeProc && claudeProc.exitCode === null &&
-		claudeSig === newCore && claudeModel !== newModel &&
+		lane.proc && lane.proc.exitCode === null &&
+		lane.sig === newCore && lane.model !== newModel &&
 		envelope.forceRespawn !== true
 	) {
-		const swapped = await trySetModel(newModel, 2000);
+		const swapped = await trySetModel(lane, newModel, 2000);
 		if (swapped) {
-			claudeModel = newModel;
+			lane.model = newModel;
 			emit('phase', { name: 'claude_model_swapped', ts: nowMs(), model: newModel });
 		} else {
 			emit('phase', { name: 'claude_model_swap_refused', ts: nowMs(), model: newModel });
@@ -811,42 +897,48 @@ async function runPersistentClaude(envelope, relay, emit) {
 	// (core signature), a failed model swap, a dead process, or the Worker's
 	// post-resume forceRespawn actually respawn.
 	const needsRespawn =
-		!claudeProc ||
-		claudeProc.exitCode !== null ||
-		claudeSig !== newCore ||
-		claudeModel !== newModel ||
+		!lane.proc ||
+		lane.proc.exitCode !== null ||
+		lane.sig !== newCore ||
+		lane.model !== newModel ||
 		// Auth transport changed (oauth↔apiKey), or the STATIC key itself changed —
 		// ANTHROPIC_API_KEY lives in the spawn env, it can't be swapped in place.
-		claudeAuthKind !== newAuthKind ||
-		(newAuthKind === 'apiKey' && claudeTokenHash !== newTokenHash) ||
+		lane.authKind !== newAuthKind ||
+		(newAuthKind === 'apiKey' && lane.tokenHash !== newTokenHash) ||
 		envelope.forceRespawn === true;
 
+	// Volta da ROTACAO: a pista foi fechada por falta de memoria e a sessao dela segue no disco →
+	// sobe com --resume (conversa, ferramentas e arquivos lidos voltam inteiros; sem refold).
+	let resumeId = null;
 	if (needsRespawn) {
-		if (claudeProc) {
-			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (claudeSig !== newCore ? 'args_changed' : (claudeAuthKind !== newAuthKind ? 'auth_changed' : (claudeModel !== newModel ? 'model_swap_failed' : (claudeTokenHash !== newTokenHash ? 'token_rotated' : 'dead')))) });
-			await killClaude('respawn');
+		if (lane.proc) {
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (lane.sig !== newCore ? 'args_changed' : (lane.authKind !== newAuthKind ? 'auth_changed' : (lane.model !== newModel ? 'model_swap_failed' : (lane.tokenHash !== newTokenHash ? 'token_rotated' : 'dead')))) });
+			await killClaude(lane, 'respawn');
 		}
+		if (lane.rotated && laneSessionOnDisk(lane)) resumeId = lane.sessionId;
+		lane.rotated = false;
+		await reserveMemoryFor(lane, emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
 		// Refresh credentials on disk and (only on first ever turn) wipe stale
 		// session lockfiles. Token may have rotated even when session args are
 		// the same, so always rewrite credentials before spawn.
-		wipeClaudeState();
+		wipeClaudeState(lane);
 		if (newAuthKind === 'apiKey') {
 			// API-key auth: the key rides the spawn env (spawnPersistentClaude).
 			// Remove any OAuth credentials left on disk (a golden baked with a sub,
 			// or a prior oauth turn) so claude can't prefer the stale OAuth pair —
 			// and DO NOT start the credWatcher: static keys never rotate, there is
 			// nothing to capture (doctrine untouched — no rotation exists here).
-			try { fs.rmSync(CRED_FILE_PATH(), { force: true }); } catch { /* best-effort */ }
-			stopCredWatcher();
+			try { fs.rmSync(lane.credFile, { force: true }); } catch { /* best-effort */ }
+			stopCredWatcher(lane);
 		} else {
-			configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
-			startCredWatcher(envelope.callback);
+			configureCcAuth(lane, envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+			startCredWatcher(lane, envelope.callback);
 		}
 		const t_spawn_called = nowMs();
-		emit('phase', { name: 'pre_claude_spawn', ts: t_spawn_called });
-		spawnPersistentClaude(envelope);
+		emit('phase', { name: 'pre_claude_spawn', ts: t_spawn_called, ...(resumeId ? { resumed: true } : {}) });
+		spawnPersistentClaude(lane, envelope, resumeId);
 		emit('phase', { name: 'claude_spawned', ts: nowMs(), since_spawn_call_ms: nowMs() - t_spawn_called });
-		activeTurn = {
+		lane.activeTurn = {
 			relay, emit, t_spawn: t_spawn_called,
 			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
 			resolve: null,
@@ -858,16 +950,16 @@ async function runPersistentClaude(envelope, relay, emit) {
 		// tracked hash; claude re-reads it on its next self-refresh, and its still-valid
 		// in-memory token keeps working until then. Do NOT wipeClaudeState() here — the
 		// session lockfiles/caches are exactly the warmth we're keeping (that's the win).
-		if (newAuthKind === 'oauth' && claudeTokenHash !== newTokenHash) {
-			configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
-			claudeTokenHash = newTokenHash;
+		if (newAuthKind === 'oauth' && lane.tokenHash !== newTokenHash) {
+			configureCcAuth(lane, envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+			lane.tokenHash = newTokenHash;
 			emit('phase', { name: 'claude_token_swapped', ts: nowMs() });
 		}
 		// apiKey mode: static key (a changed key respawned above); keep the
 		// watcher DISARMED — there is no rotation to capture.
-		if (newAuthKind === 'oauth') startCredWatcher(envelope.callback);
+		if (newAuthKind === 'oauth') startCredWatcher(lane, envelope.callback);
 		emit('phase', { name: 'claude_reused', ts: nowMs() });
-		activeTurn = {
+		lane.activeTurn = {
 			relay, emit, t_spawn: nowMs(),
 			firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
 			resolve: null,
@@ -881,9 +973,10 @@ async function runPersistentClaude(envelope, relay, emit) {
 	// So: whenever WE had to spawn a fresh claude (needsRespawn) and the envelope
 	// carries the chat's priorContext, fold it into the prompt HERE. The sentinel
 	// check makes it idempotent (the Worker pre-folds on clone/base-cold paths — do
-	// not fold twice). Warm reuse skips: claude remembers natively.
+	// not fold twice). Warm reuse skips: claude remembers natively. --resume tambem:
+	// a sessao voltou inteira, refoldar duplicaria a conversa.
 	let promptContent = envelope.prompt;
-	if (needsRespawn && envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
+	if (needsRespawn && !resumeId && envelope.priorContext && !String(promptContent).includes('## Mensagem atual do usuário')) {
 		promptContent = `${envelope.priorContext}\n\n## Mensagem atual do usuário\n\n${promptContent}`;
 		emit('phase', { name: 'context_refolded', ts: nowMs(), chars: envelope.priorContext.length });
 	}
@@ -895,17 +988,17 @@ async function runPersistentClaude(envelope, relay, emit) {
 		message: { role: 'user', content: promptContent },
 	};
 	try {
-		claudeProc.stdin.write(JSON.stringify(userEvent) + '\n');
-		claudeBusy = true;
+		lane.proc.stdin.write(JSON.stringify(userEvent) + '\n');
+		lane.busy = true;
 	} catch (err) {
 		emit('error', { code: 'internal', message: `stdin write failed: ${err && err.message}`, retryable: true });
-		activeTurn = null;
+		lane.activeTurn = null;
 		return;
 	}
 
 	// Wait for the 'result' event (set by handleClaudeStdout) or process exit.
 	await new Promise((resolve) => {
-		if (activeTurn) activeTurn.resolve = resolve;
+		if (lane.activeTurn) lane.activeTurn.resolve = resolve;
 		else resolve(); // already settled by an exit
 	});
 }
@@ -924,20 +1017,21 @@ async function runPersistentClaude(envelope, relay, emit) {
 //    $CODEX_HOME/auth.json. codex self-rotates it (same doctrine as the CC sub:
 //    the ENGINE is the only rotator; a watcher captures the rotation back).
 //  · key  (envelope.codexApiKey): CODEX_API_KEY at spawn — static, no rotation.
-const CODEX_HOME = process.env.CODEX_HOME || '/workspace/.codex';
-function CODEX_AUTH_PATH() { return path.join(CODEX_HOME, 'auth.json'); }
+// CODEX_HOME e da PISTA (lane.codexHome): box propria = $CODEX_HOME ou /workspace/.codex (como
+// sempre); pista de box compartilhada = /workspace/.lanes/<chat>/codex (conta e sessoes do chat).
 
-async function runCodexTurn(envelope, relay, emit) {
-	// A live claude from a previous engine on this box (chat switched engines)
+async function runCodexTurn(lane, envelope, relay, emit) {
+	const CODEX_HOME = lane.codexHome;
+	// A live claude from a previous engine on this lane (chat switched engines)
 	// must not linger — kill it; the codex golden lives in its own namespace.
-	if (claudeProc) await killClaude('engine_switch');
+	if (lane.proc) await killClaude(lane, 'engine_switch');
 
 	// Feed claude-format lines through the NORMAL stdout pipeline (relay write,
 	// phase markers, result capture). This is the whole adapter trick.
-	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	const feed = (obj) => handleClaudeStdout(lane, Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
 	let turnDone;
 	const done = new Promise((r) => { turnDone = r; });
-	activeTurn = {
+	lane.activeTurn = {
 		relay, emit, t_spawn: nowMs(),
 		firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false,
 		resolve: turnDone,
@@ -951,7 +1045,7 @@ async function runCodexTurn(envelope, relay, emit) {
 	// manual transcript refold, no re-derivation). Only a fresh chat — or a reset that
 	// wiped the volume — starts a new session. Mirrors claude's warm-resume, but via
 	// codex's session files instead of a resident process (codex exec is one-shot).
-	const RUN_CWD = process.env.RUN_CWD || '/workspace';
+	const RUN_CWD = lane.cwd;
 	const sessionsDir = path.join(CODEX_HOME, 'sessions');
 	let hasSession = false;
 	try {
@@ -1071,25 +1165,26 @@ async function runCodexTurn(envelope, relay, emit) {
 	if (envelope.codexAuth) {
 		try {
 			fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 });
-			fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 });
-			codexAuthLastReported = codexAuthFingerprint();
-			startCodexAuthWatcher(envelope.callback);
+			fs.writeFileSync(lane.codexAuthFile, typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 });
+			lane.cx.last = codexAuthFingerprint(lane);
+			startCodexAuthWatcher(lane, envelope.callback);
 		} catch (e) { logError('codex auth.json write failed', { msg: e && e.message }); }
 	} else if (envelope.codexApiKey) {
 		// static key mode — no auth.json, no watcher.
-		try { fs.rmSync(CODEX_AUTH_PATH(), { force: true }); } catch {}
+		try { fs.rmSync(lane.codexAuthFile, { force: true }); } catch {}
 		codexEnv.CODEX_API_KEY = envelope.codexApiKey;
 		codexEnv.OPENAI_API_KEY = envelope.codexApiKey;
 	}
 	emit('phase', { name: 'codex_spawn', ts: nowMs(), auth: envelope.codexAuth ? 'sub' : 'key' });
+	lane.mark = newTurnMark();
 	const proc = spawnInTurnCgroup('codex', args, {
 		detached: true, // setsid: o turno e a SESSAO (ver waitTurnQuiet)
-		cwd: process.env.RUN_CWD || '/workspace',
-		env: { ...codexEnv, [TURN_ENV]: (engineTurnMark = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`) },
+		cwd: lane.cwd,
+		env: { ...codexEnv, [TURN_ENV]: lane.mark },
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
-	engineSid = proc.pid;
-	claudeBgTasks = 0; claudeBgTaskNames = []; // codex nao tem subagente
+	lane.sid = proc.pid;
+	lane.bgTasks = 0; lane.bgTaskNames = []; // codex nao tem subagente
 	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
 
 	let buf = '';
@@ -1228,7 +1323,7 @@ async function runCodexTurn(envelope, relay, emit) {
 		// auth.json guardado parado desde 2026-08-06, e todo turno depois da primeira
 		// rotação morrendo com "refresh token was already used". Reportar ANTES de
 		// fechar o turno é o que torna a captura determinística.
-		if (codexAuthReport) { try { await codexAuthReport(); } catch { /* nunca derruba o turno */ } }
+		if (lane.cx.report) { try { await lane.cx.report(); } catch { /* nunca derruba o turno */ } }
 		// claude-format result closes the turn: pendingResult (save callback) +
 		// the Worker translator's finish, exactly like a claude turn.
 		feed({
@@ -1252,10 +1347,11 @@ async function runCodexTurn(envelope, relay, emit) {
 // them with no translator change), keeps the CLI polling, and on success mirrors
 // the resulting auth.json to the Worker via the callback.
 async function runCodexLogin(envelope, relay, emit) {
-	if (claudeProc) await killClaude('codex_login'); // free the box's engine slot
-	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	const lane = ownLane(); const CODEX_HOME = lane.codexHome; // box one-shot: a pista unica
+	if (lane.proc) await killClaude(lane, 'codex_login'); // free the box's engine slot
+	const feed = (obj) => handleClaudeStdout(lane, Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
 	let done; const p = new Promise((r) => { done = r; });
-	activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
+	lane.activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
 	feed({ type: 'system', subtype: 'init' });
 
 	try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
@@ -1285,7 +1381,7 @@ async function runCodexLogin(envelope, relay, emit) {
 	proc.on('exit', async (exitCode) => {
 		let ok = false;
 		try {
-			const raw = fs.readFileSync(CODEX_AUTH_PATH(), 'utf8');
+			const raw = fs.readFileSync(lane.codexAuthFile, 'utf8');
 			if (raw.trim() && envelope.callback && envelope.callback.url) {
 				const cbUrl = envelope.callback.url.replace(/\/internal\/chat-result$/, '/internal/codex-credentials');
 				const r = await fetch(cbUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(envelope.callback.jwt ? { Authorization: `Bearer ${envelope.callback.jwt}` } : {}) }, body: JSON.stringify({ authJson: raw }) });
@@ -1310,15 +1406,16 @@ async function runCodexLogin(envelope, relay, emit) {
 // posts the parsed list [{id,displayName,description,isDefault,reasoningEfforts}]
 // to /internal/codex-models via the callback. Never a hardcoded list.
 async function runCodexModels(envelope, relay, emit) {
-	if (claudeProc) await killClaude('codex_models');
-	const feed = (obj) => handleClaudeStdout(Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+	const lane = ownLane(); const CODEX_HOME = lane.codexHome; // box one-shot: a pista unica
+	if (lane.proc) await killClaude(lane, 'codex_models');
+	const feed = (obj) => handleClaudeStdout(lane, Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
 	let done; const p = new Promise((r) => { done = r; });
-	activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
+	lane.activeTurn = { relay, emit, t_spawn: nowMs(), firstStdoutSeen: false, firstSystemSeen: false, firstAssistantSeen: false, resolve: done };
 	feed({ type: 'system', subtype: 'init' });
 
 	try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
 	if (envelope.codexAuth) {
-		try { fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch {}
+		try { fs.writeFileSync(lane.codexAuthFile, typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch {}
 	}
 	emit('phase', { name: 'codex_models_spawn', ts: nowMs() });
 	const proc = spawn('codex', ['app-server'], { cwd: '/workspace', env: { ...process.env, CODEX_HOME }, stdio: ['pipe', 'pipe', 'ignore'] });
@@ -1396,13 +1493,15 @@ function apiKeyMatches(req) {
 // are REBOUND on every /run (SNAPSHOT TRAP: process globals freeze into forks;
 // a stale pubkey would reject every token after a key rotation).
 // The token opens ONLY GET /stream. /run keeps demanding the pinned x-api-key.
-let streamChatId = null;   // chatId of the current/last turn (token must match)
+// Chats que rodaram turno NESTA box (o token tem que ser de um deles). Box propria = um chat;
+// box compartilhada = varios. Rebind a cada /run (snapshot trap: o conjunto cresce com a box).
+const streamChats = new Set();
 let streamPubKey = null;   // Ed25519 SPKI DER (Buffer) or null = feature off
 function b64urlDecode(str) {
 	const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
 	return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
 }
-/** Returns null when valid, else a short reason. */
+/** Returns null when valid, else a short reason. Valid token → req.streamChat = o chat dele. */
 function userStreamTokenWhy(req) {
 	if (!streamPubKey) return 'no_pubkey';
 	let raw = '';
@@ -1420,7 +1519,8 @@ function userStreamTokenWhy(req) {
 	try { ok = crypto.verify(null, payloadBuf, { key: streamPubKey, format: 'der', type: 'spki' }, sig); } catch { ok = false; }
 	if (!ok) return 'bad_sig';
 	if (payload.e <= Math.floor(Date.now() / 1000)) return 'expired';
-	if (!streamChatId || payload.c !== streamChatId) return 'wrong_chat';
+	if (!streamChats.has(payload.c)) return 'wrong_chat';
+	req.streamChat = payload.c;
 	return null;
 }
 
@@ -1578,7 +1678,9 @@ const server = http.createServer(async (req, res) => {
 	if (isStreamGet) {
 		const q = req.url.indexOf('?');
 		const wantPrompt = q >= 0 ? new URLSearchParams(req.url.slice(q + 1)).get('promptId') : null;
-		const target = relayFor(wantPrompt);
+		const qs = q >= 0 ? new URLSearchParams(req.url.slice(q + 1)) : null;
+		// token de usuario = so o chat dele; o Worker (chave) pode filtrar por ?chatId=
+		const target = relayFor(wantPrompt, req.streamChat || (qs && qs.get('chatId')) || null);
 		if (!target) { res.writeHead(204).end(); return; }
 		res.writeHead(200, {
 			'Content-Type': 'application/x-ndjson',
@@ -1636,7 +1738,7 @@ const server = http.createServer(async (req, res) => {
 	const mode = envelope.mode || 'cc-cli';
 
 	// REBIND the user-stream identity every turn (never trust the frozen global).
-	streamChatId = envelope.chatId || (envelope.workspaceProxy && envelope.workspaceProxy.chatId) || null;
+	{ const c = envelope.chatId || (envelope.workspaceProxy && envelope.workspaceProxy.chatId) || null; if (c) streamChats.add(c); }
 	streamPubKey = (typeof envelope.streamPubKey === 'string' && envelope.streamPubKey) ? Buffer.from(envelope.streamPubKey, 'base64') : null;
 
 	// Open streaming response. Chunked transfer encoding by default in Node.
@@ -1677,18 +1779,23 @@ const server = http.createServer(async (req, res) => {
 
 	// A VEZ DO ENGINE (ver FILA NO ADAPTER). release() e idempotente e roda no ponto em que
 	// o engine terminou (antes da espera por background) ou, no pior caso, no finally.
-	const prevEngine = engineChain;
+	// A fila e POR PISTA: na box compartilhada, chats diferentes rodam ao mesmo tempo; dentro de
+	// um chat, a mensagem 2 espera a 1 (como sempre). Box propria = uma pista = a fila de antes.
+	const lane = laneFor(envelope);
+	lane.openRuns++;
+	lane.lastUsed = nowMs();
+	const prevEngine = lane.chain;
 	let releaseEngine = () => {};
-	engineChain = new Promise((r) => { releaseEngine = r; });
+	lane.chain = new Promise((r) => { releaseEngine = r; });
 	let engineReleased = false;
-	const release = () => { if (engineReleased) return; engineReleased = true; engineBusy = false; runsCompleted++; releaseEngine(); };
-	if (engineBusy) emit('phase', { name: 'queued_in_box', ts: nowMs() });
+	const release = () => { if (engineReleased) return; engineReleased = true; lane.engineBusy = false; runsCompleted++; releaseEngine(); };
+	if (lane.engineBusy) emit('phase', { name: 'queued_in_box', ts: nowMs() });
 	await prevEngine;
-	engineBusy = true;
+	lane.engineBusy = true;
 	// contexto do turno pra espera por background: janela [since, until) + sessao/marcador do engine
-	const turnCtx = { sid: null, mark: null, since: uptimeTicks(), until: null };
-	if (lastTurnCtx) lastTurnCtx.until = turnCtx.since;
-	lastTurnCtx = turnCtx;
+	const turnCtx = { sid: null, mark: null, since: uptimeTicks(), until: null, lane };
+	if (lane.lastTurnCtx) lane.lastTurnCtx.until = turnCtx.since;
+	lane.lastTurnCtx = turnCtx;
 
 	// Dispatch.
 	try {
@@ -1715,12 +1822,12 @@ const server = http.createServer(async (req, res) => {
 				// this golden is codex-authed and ready. Accepts EITHER credential shape
 				// (sub > key) — the standardization point: a new engine's warmup lives here.
 				if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codex warmup needs codexAuth (sub) or codexApiKey');
-				const codexEnvW = { ...process.env, CODEX_HOME };
-				try { fs.mkdirSync(CODEX_HOME, { recursive: true, mode: 0o700 }); } catch {}
+				const codexEnvW = { ...process.env, CODEX_HOME: lane.codexHome };
+				try { fs.mkdirSync(lane.codexHome, { recursive: true, mode: 0o700 }); } catch {}
 				if (envelope.codexAuth) {
-					try { fs.writeFileSync(CODEX_AUTH_PATH(), typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch (e) { logError('codex warmup auth.json write failed', { msg: e && e.message }); }
+					try { fs.writeFileSync(lane.codexAuthFile, typeof envelope.codexAuth === 'string' ? envelope.codexAuth : JSON.stringify(envelope.codexAuth), { mode: 0o600 }); } catch (e) { logError('codex warmup auth.json write failed', { msg: e && e.message }); }
 				} else if (envelope.codexApiKey) {
-					try { fs.rmSync(CODEX_AUTH_PATH(), { force: true }); } catch {}
+					try { fs.rmSync(lane.codexAuthFile, { force: true }); } catch {}
 					codexEnvW.CODEX_API_KEY = envelope.codexApiKey; codexEnvW.OPENAI_API_KEY = envelope.codexApiKey;
 				}
 				const ok = await new Promise((resolve) => {
@@ -1734,24 +1841,21 @@ const server = http.createServer(async (req, res) => {
 				return; // no claude state to set
 			}
 			if (!envelope.ccToken && !envelope.ccApiKey) throw new Error('ccToken or ccApiKey required for warmupOnly');
-			if (!claudeProc || claudeProc.exitCode !== null || claudeSig !== coreSignature(envelope)) {
-				if (claudeProc) await killClaude('warmup_respawn');
-				wipeClaudeState();
+			if (!lane.proc || lane.proc.exitCode !== null || lane.sig !== coreSignature(envelope)) {
+				if (lane.proc) await killClaude(lane, 'warmup_respawn');
+				wipeClaudeState(lane);
 				if (envelope.ccApiKey) {
 					// API-key warmup (akey: goldens): key via spawn env, no creds file, no watcher.
-					try { fs.rmSync(CRED_FILE_PATH(), { force: true }); } catch { /* best-effort */ }
-					stopCredWatcher();
+					try { fs.rmSync(lane.credFile, { force: true }); } catch { /* best-effort */ }
+					stopCredWatcher(lane);
 				} else {
-					configureCcAuth(envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
-					startCredWatcher(envelope.callback);
+					configureCcAuth(lane, envelope.ccToken, envelope.ccRefreshToken, envelope.ccExpiresAt);
+					startCredWatcher(lane, envelope.callback);
 				}
 				emit('phase', { name: 'pre_claude_spawn', ts: nowMs() });
-				spawnPersistentClaude(envelope);
-				claudeSig = coreSignature(envelope);
-				claudeModel = envelope.model || null;
-				claudeTokenHash = tokenHash(envelope.ccApiKey || envelope.ccToken);
+				spawnPersistentClaude(lane, envelope, null); // define sig/model/tokenHash da pista
 			}
-			const alive = await trySetModel(envelope.model || claudeModel || 'claude-opus-4-8', 15_000);
+			const alive = await trySetModel(lane, envelope.model || lane.model || 'claude-opus-4-8', 15_000);
 			emit('phase', { name: 'claude_warmup_ready', ts: nowMs(), ack: alive });
 			if (!alive) emit('error', { code: 'warmup_no_ack', message: 'claude did not ack the control ping', retryable: true });
 		} else if (mode === 'codex-login') {
@@ -1772,8 +1876,8 @@ const server = http.createServer(async (req, res) => {
 			// adapter feeds claude-format events so everything downstream is shared.
 			if (!envelope.prompt) throw new Error('prompt required for engine=codex');
 			if (!envelope.codexAuth && !envelope.codexApiKey) throw new Error('codexAuth (sub) or codexApiKey required for engine=codex');
-			await runCodexTurn(envelope, relay, emit);
-			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark;
+			await runCodexTurn(lane, envelope, relay, emit);
+			turnCtx.sid = lane.sid; turnCtx.mark = lane.mark;
 			release(); // o engine terminou: a proxima mensagem ja pode rodar
 			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000, turnCtx)).left.length;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received, engine: 'codex' });
@@ -1792,11 +1896,11 @@ const server = http.createServer(async (req, res) => {
 			//    ~20-25s OAuth handshake cost. Subsequent turns are ~2-3s.
 			//    Credentials wipe + write happens INSIDE runPersistentClaude
 			//    when (and only when) a respawn is needed.
-			await runPersistentClaude(envelope, relay, emit);
-			turnCtx.sid = engineSid; turnCtx.mark = engineTurnMark; turnCtx.engine = 'claude'; turnCtx.relay = relay;
+			await runPersistentClaude(lane, envelope, relay, emit);
+			turnCtx.sid = lane.sid; turnCtx.mark = lane.mark; turnCtx.engine = 'claude'; turnCtx.relay = relay;
 			release(); // o engine terminou (result): a proxima mensagem ja pode rodar
 			relay.backgroundLeft = (await waitTurnQuiet(emit, envelope.backgroundWaitMs || 10 * 60 * 1000, turnCtx)).left.length;
-			if (lingerTurn && lingerTurn.relay === relay) lingerTurn = null;
+			if (lane.lingerTurn && lane.lingerTurn.relay === relay) lane.lingerTurn = null;
 			emit('phase', { name: 'post_claude_exit', ts: nowMs(), since_run_received_ms: nowMs() - t_run_received });
 		} else if (mode === 'slot' && envelope.warmupOnly === true) {
 			// SLOT WARMUP (Fase 1): boot the client's server, NO turn — the Worker
@@ -1846,7 +1950,9 @@ const server = http.createServer(async (req, res) => {
 		// left pointing at the finished relay (done=true): a late F5 hitting
 		// /stream still gets the whole turn replayed from its buffer until the
 		// next /run replaces it. Never let teardown throw.
-		if (credWatcherReport) { try { await credWatcherReport(); } catch {} }
+		lane.openRuns--;
+		lane.lastUsed = nowMs();
+		if (lane.cred.report) { try { await lane.cred.report(); } catch {} }
 		try {
 			const out = await relay.complete(relay.pendingResult || {});
 			if (out && out.ok === false) logError('save callback failed', { status: out.status, error: out.error });
