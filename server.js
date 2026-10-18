@@ -82,6 +82,10 @@ class Lane {
 		// watchers de credencial (por pista: cada uma tem a propria conta)
 		this.cred = { callback: null, started: false, last: '', report: null };
 		this.cx = { callback: null, started: false, last: '', report: null };
+		// STOP do usuario (dono, 2026-10-17: a box so encerra no idle — o STOP para o TURNO do chat,
+		// nunca a box). stopAt = quando o ultimo STOP chegou; /run que chegou antes e ainda esperava
+		// a vez e descartado, e a espera por background do turno parado acaba na hora.
+		this.stopAt = 0; this.cxProc = null; this.lastChatId = null;
 	}
 	get claudeDir() { return this.claudeConfigDir || path.join(process.env.HOME || '/workspace', '.claude'); }
 	get credFile() { return path.join(this.claudeDir, '.credentials.json'); }
@@ -267,6 +271,11 @@ async function waitTurnQuiet(emit, maxMs, ctx) {
 		// A continuacao do claude (acordou com task-notification) e DESTE turno enquanto ele for
 		// o lingering — mesmo que a proxima mensagem ja tenha chegado (ela espera o claude ocioso).
 		const L = ctx.lane;
+		// STOP: o usuario parou este turno — nada mais a esperar (interruptLane ja matou o que sobrou)
+		if (L.stopAt >= (ctx.startedAt || 0)) {
+			emit('phase', { name: 'background_stopped', ts: nowMs(), waited_ms: nowMs() - t0 });
+			return { waitedMs: nowMs() - t0, left: [] };
+		}
 		const mine = ctx.engine === 'claude' && L.lingerTurn && L.lingerTurn.relay === ctx.relay;
 		const claudeWorking = mine && (L.busy || nowMs() - L.lastOut < 1500);
 		const bg = (ctx.until == null ? L.bgTasks : 0) + (claudeWorking ? 1 : 0);
@@ -832,6 +841,61 @@ async function reserveMemoryFor(lane, emit, maxWaitMs) {
 		await new Promise((r) => setTimeout(r, 1000));
 	}
 }
+/**
+ * STOP de UM chat (dono, 2026-10-17: "o stop so deve acontecer agora sempre no idle"). Antes o
+ * STOP destruia a box inteira; agora para so o turno da pista e o trabalho que ele deixou, e a box
+ * segue a regra de sempre (pausa quando nada mais roda). claude: interrupt nativo (control_request);
+ * sem resposta em 3s → mata o processo e a proxima mensagem volta na MESMA sessao (--resume).
+ * codex: mata o exec do turno. Background do turno (sessao/marcador da pista): SIGTERM.
+ */
+function sendClaudeInterrupt(lane, timeoutMs) {
+	return new Promise((resolve) => {
+		if (!lane.proc || lane.proc.exitCode !== null) return resolve(false);
+		const id = `int_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+		const timer = setTimeout(() => { lane.waiters.delete(id); resolve(false); }, timeoutMs);
+		lane.waiters.set(id, () => { clearTimeout(timer); lane.waiters.delete(id); resolve(true); });
+		try { lane.proc.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'interrupt' } }) + '\n'); }
+		catch { clearTimeout(timer); lane.waiters.delete(id); resolve(false); }
+	});
+}
+async function interruptLane(lane) {
+	lane.stopAt = nowMs();
+	const out = { lane: lane.key, interrupted: false, claude: null, codex: false, killed: 0 };
+	if (lane.cxProc && lane.cxProc.exitCode === null) {
+		try { process.kill(-lane.cxProc.pid, 'SIGTERM'); } catch { try { lane.cxProc.kill('SIGTERM'); } catch { /* ja saiu */ } }
+		out.codex = true; out.interrupted = true;
+	}
+	if (lane.proc && lane.proc.exitCode === null && (lane.activeTurn || lane.lingerTurn || lane.busy)) {
+		const acked = await sendClaudeInterrupt(lane, 3000);
+		const t0 = nowMs();
+		while ((lane.activeTurn || lane.busy) && nowMs() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
+		if (lane.activeTurn || lane.busy || !acked) {
+			lane.rotated = true; // sessao no disco: a proxima mensagem volta nela com --resume
+			await killClaude(lane, 'stop');
+			// killClaude solta o processo antes de matar, entao o exit nao fecha o turno: fecha aqui
+			if (lane.activeTurn) {
+				const t = lane.activeTurn; lane.activeTurn = null;
+				try { t.emit('error', { code: 'cancelled', message: 'turno parado pelo STOP', retryable: false }); } catch { /* sink fechado */ }
+				if (t.resolve) t.resolve();
+			}
+			lane.busy = false;
+			out.claude = 'killed';
+		} else out.claude = 'interrupted';
+		lane.lingerTurn = null;
+		out.interrupted = true;
+	}
+	// o que o turno deixou rodando (servidor, build, subagente) — so desta pista
+	const keep = lane.proc && lane.proc.exitCode === null ? lane.proc.pid : null;
+	// so o que nasceu depois que o ultimo turno da pista comecou (filhos do claude de antes, como
+	// MCP stdio, ficam — sao do processo, nao do turno; mesma janela do waitTurnQuiet)
+	const since = lane.lastTurnCtx ? lane.lastTurnCtx.since : uptimeTicks();
+	const strays = lane.sid ? liveTurnProcs(lane.sid, since, keep, lane.mark, null) : [];
+	for (const p of strays) { try { process.kill(p.pid, 'SIGTERM'); out.killed++; } catch { /* ja saiu */ } }
+	if (out.killed) out.interrupted = true;
+	lane.bgTasks = 0; lane.bgTaskNames = [];
+	logInfo('lane interrupted (STOP)', out);
+	return out;
+}
 /** A sessao do Claude Code desta pista ainda esta no disco? (--resume de sessao sumida = erro) */
 function laneSessionOnDisk(lane) {
 	if (!lane.sessionId) return false;
@@ -905,18 +969,23 @@ async function runPersistentClaude(lane, envelope, relay, emit) {
 		// ANTHROPIC_API_KEY lives in the spawn env, it can't be swapped in place.
 		lane.authKind !== newAuthKind ||
 		(newAuthKind === 'apiKey' && lane.tokenHash !== newTokenHash) ||
-		envelope.forceRespawn === true;
+		envelope.forceRespawn === true ||
+		// TROCA DE PROVEDOR (dono, 2026-10-17: "a troca sempre e um novo chat que recebe historico"):
+		// o chat passou por outro engine desde a ultima vez que este claude falou — a sessao dele
+		// nao tem o que o outro respondeu. Sessao NOVA com o historico inteiro (refold abaixo).
+		envelope.freshSession === true;
 
 	// Volta da ROTACAO: a pista foi fechada por falta de memoria e a sessao dela segue no disco →
 	// sobe com --resume (conversa, ferramentas e arquivos lidos voltam inteiros; sem refold).
 	let resumeId = null;
 	if (needsRespawn) {
 		if (lane.proc) {
-			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.forceRespawn === true ? 'post_resume' : (lane.sig !== newCore ? 'args_changed' : (lane.authKind !== newAuthKind ? 'auth_changed' : (lane.model !== newModel ? 'model_swap_failed' : (lane.tokenHash !== newTokenHash ? 'token_rotated' : 'dead')))) });
+			emit('phase', { name: 'claude_respawn', ts: nowMs(), reason: envelope.freshSession === true ? 'provider_switch' : envelope.forceRespawn === true ? 'post_resume' : (lane.sig !== newCore ? 'args_changed' : (lane.authKind !== newAuthKind ? 'auth_changed' : (lane.model !== newModel ? 'model_swap_failed' : (lane.tokenHash !== newTokenHash ? 'token_rotated' : 'dead')))) });
 			await killClaude(lane, 'respawn');
 		}
-		if (lane.rotated && laneSessionOnDisk(lane)) resumeId = lane.sessionId;
+		if (lane.rotated && laneSessionOnDisk(lane) && envelope.freshSession !== true) resumeId = lane.sessionId;
 		lane.rotated = false;
+		if (envelope.freshSession === true) { lane.sessionId = null; emit('phase', { name: 'fresh_session', ts: nowMs(), engine: 'claude' }); }
 		await reserveMemoryFor(lane, emit, envelope.backgroundWaitMs || 10 * 60 * 1000);
 		// Refresh credentials on disk and (only on first ever turn) wipe stale
 		// session lockfiles. Token may have rotated even when session args are
@@ -1060,6 +1129,11 @@ async function runCodexTurn(lane, envelope, relay, emit) {
 	// erro; provado em prod 2026-09-19, todo 1o turno apos agentRecycle). Cold = sessao nova
 	// com o historico refolded (o Worker ja manda o fold quando sabe que e cold). Golden e
 	// resume de pause restauram a RAM com runsCompleted >= 1, entao NAO caem aqui.
+	if (hasSession && envelope.freshSession === true) {
+		// troca de provedor: a sessao do codex no disco nao tem o que o outro engine respondeu
+		emit('phase', { name: 'fresh_session', ts: nowMs(), engine: 'codex' });
+		hasSession = false;
+	}
 	if (hasSession && runsCompleted === 0) {
 		emit('phase', { name: 'codex_cold_ignores_session', ts: nowMs() });
 		logInfo('codex: box cold — ignorando sessao do volume, sessao nova com fold');
@@ -1184,6 +1258,7 @@ async function runCodexTurn(lane, envelope, relay, emit) {
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	lane.sid = proc.pid;
+	lane.cxProc = proc; proc.once('exit', () => { if (lane.cxProc === proc) lane.cxProc = null; });
 	lane.bgTasks = 0; lane.bgTaskNames = []; // codex nao tem subagente
 	feed({ type: 'system', subtype: 'init' }); // claude_first_system phase (adapter alive)
 
@@ -1651,7 +1726,10 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// Open on purpose: static liveness for Detona's build/readiness probes.
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ status: 'ok', inFlight: openRuns > 0 }));
+		// busyChats: quais chats tem turno aberto (rodando, na vez ou segurando background). Box
+		// compartilhada: o Worker so pausa quando nenhum OUTRO chat da box esta aqui.
+		const busyChats = [...lanes.values()].filter((l) => l.openRuns > 0).map((l) => l.lastChatId || l.key);
+		res.end(JSON.stringify({ status: 'ok', inFlight: openRuns > 0, busyChats }));
 		return;
 	}
 
@@ -1694,6 +1772,17 @@ const server = http.createServer(async (req, res) => {
 		const ka = setInterval(() => { try { res.write(JSON.stringify({ type: 'ping' }) + '\n'); } catch { clearInterval(ka); } }, 20_000);
 		const stopKa = () => clearInterval(ka);
 		res.on('close', stopKa); res.on('error', stopKa); res.on('finish', stopKa);
+		return;
+	}
+
+	if (req.method === 'POST' && req.url === '/interrupt') {
+		let b = '';
+		for await (const c of req) { b += c; if (b.length > 4096) break; }
+		let chatId = null; try { chatId = JSON.parse(b || '{}').chatId || null; } catch { /* corpo invalido = sem chat */ }
+		const lane = chatId && lanes.get(chatId) ? lanes.get(chatId) : [...lanes.values()].find((l) => l.lastChatId && l.lastChatId === chatId) || null;
+		const out = lane ? await interruptLane(lane) : { lane: null, interrupted: false };
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ ok: true, chatId, ...out }));
 		return;
 	}
 
@@ -1782,8 +1871,10 @@ const server = http.createServer(async (req, res) => {
 	// A fila e POR PISTA: na box compartilhada, chats diferentes rodam ao mesmo tempo; dentro de
 	// um chat, a mensagem 2 espera a 1 (como sempre). Box propria = uma pista = a fila de antes.
 	const lane = laneFor(envelope);
+	const arrivedAt = nowMs();
 	lane.openRuns++;
-	lane.lastUsed = nowMs();
+	lane.lastUsed = arrivedAt;
+	lane.lastChatId = relay.chatId || lane.lastChatId;
 	const prevEngine = lane.chain;
 	let releaseEngine = () => {};
 	lane.chain = new Promise((r) => { releaseEngine = r; });
@@ -1792,8 +1883,11 @@ const server = http.createServer(async (req, res) => {
 	if (lane.engineBusy) emit('phase', { name: 'queued_in_box', ts: nowMs() });
 	await prevEngine;
 	lane.engineBusy = true;
+	// STOP chegou enquanto esta mensagem esperava a vez: o usuario cancelou a conversa ate aqui
+	// (o Worker ja marcou os prompts como cancelled) — nao roda.
+	const cancelledInQueue = lane.stopAt >= arrivedAt;
 	// contexto do turno pra espera por background: janela [since, until) + sessao/marcador do engine
-	const turnCtx = { sid: null, mark: null, since: uptimeTicks(), until: null, lane };
+	const turnCtx = { sid: null, mark: null, since: uptimeTicks(), until: null, lane, startedAt: arrivedAt };
 	if (lane.lastTurnCtx) lane.lastTurnCtx.until = turnCtx.since;
 	lane.lastTurnCtx = turnCtx;
 
@@ -1805,7 +1899,10 @@ const server = http.createServer(async (req, res) => {
 		const t_run_received = nowMs();
 		emit('phase', { name: 'run_received', ts: t_run_received });
 
-		if (mode === 'cc-cli' && envelope.warmupOnly === true) {
+		if (cancelledInQueue && mode === 'cc-cli') {
+			emit('phase', { name: 'cancelled_in_queue', ts: nowMs() });
+			emit('error', { code: 'cancelled', message: 'turno cancelado pelo STOP antes de comecar', retryable: false });
+		} else if (mode === 'cc-cli' && envelope.warmupOnly === true) {
 			// WARMUP-ONLY (inline fork, 2026-07-07): boot claude — wipe stale sessions,
 			// write the FULL cred pair, spawn, start the cred watcher — but send NO user
 			// message. The Worker forks this box into the golden right after, so the
