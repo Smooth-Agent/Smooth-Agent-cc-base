@@ -26,7 +26,7 @@ USER root
 
 # Claude Code CLI (official npm package).
 # Pinned via build arg so customers can rebuild against a known version.
-ARG CC_VERSION=2.1.282
+ARG CC_VERSION=2.1.302
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CC_VERSION}" \
  && npm cache clean --force
 
