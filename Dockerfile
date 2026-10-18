@@ -54,6 +54,11 @@ COPY --chown=root:root --chmod=0755 server.js /opt/smoothagent/server.js
 # relay.js — required by server.js (per-turn retain/send/save transport). MUST be
 # copied or the HTTP /run path fails with "Cannot find module './relay'".
 COPY --chown=root:root --chmod=0644 relay.js /opt/smoothagent/relay.js
+# Módulos do adapter: lib/ (comum), engines/ (um arquivo por provedor), runtimes/ (slot).
+# Faltar uma pasta = "Cannot find module" no primeiro /run — o canário pega.
+COPY --chown=root:root --chmod=0644 lib/ /opt/smoothagent/lib/
+COPY --chown=root:root --chmod=0644 engines/ /opt/smoothagent/engines/
+COPY --chown=root:root --chmod=0644 runtimes/ /opt/smoothagent/runtimes/
 # echo-slot.js — the SLOT_CONTRACT reference implementation (Fase 1 PoC). Tiny;
 # ships in the base so the slot pipeline is testable on ANY box without a custom
 # image. Real clients bring their own server (own image/layer) instead.

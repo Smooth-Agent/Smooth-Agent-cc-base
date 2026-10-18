@@ -103,6 +103,9 @@ class TurnRelay {
             // state — the Worker persists it (chats.slot_context) and returns it
             // as `context` on the next turn. Absent for cc-cli turns.
             ...(result && typeof result.context === 'string' ? { context: result.context } : {}),
+            // mensagens que o PROVEDOR juntou a este turno (entraram enquanto ele rodava): o Worker
+            // marca cada uma como 'merged' nesta resposta — ela é a resposta delas também
+            ...(result && Array.isArray(result.mergedPromptIds) && result.mergedPromptIds.length ? { mergedPromptIds: result.mergedPromptIds } : {}),
             // TURNO-ATE-QUIETO: quantos processos/tarefas do turno AINDA rodavam quando o
             // teto estourou (0 = tudo acabou). O Worker pausa a box neste callback — e so
             // se isto for 0. E o unico sinal de fim de turno que sobrevive a um stream
