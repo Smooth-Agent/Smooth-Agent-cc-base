@@ -1780,7 +1780,12 @@ const server = http.createServer(async (req, res) => {
 		for await (const c of req) { b += c; if (b.length > 4096) break; }
 		let chatId = null; try { chatId = JSON.parse(b || '{}').chatId || null; } catch { /* corpo invalido = sem chat */ }
 		const lane = chatId && lanes.get(chatId) ? lanes.get(chatId) : [...lanes.values()].find((l) => l.lastChatId && l.lastChatId === chatId) || null;
+		// os turnos DESTE chat abertos agora (rodando ou na vez): o Worker cancela exatamente esses no
+		// D1, qualquer que seja o status que eles tenham lá (um aviso de erro no meio do turno, um
+		// callback que gravou antes) — o STOP tem que valer sempre
+		const openPromptIds = openRelays.filter((r) => r.chatId === chatId && r.promptId && !r.done).map((r) => r.promptId);
 		const out = lane ? await interruptLane(lane) : { lane: null, interrupted: false };
+		out.promptIds = openPromptIds;
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ ok: true, chatId, ...out }));
 		return;
