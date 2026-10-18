@@ -76,8 +76,26 @@ async function attachment(engine, message) {
 	}
 }
 
+/**
+ * BOX COMPARTILHADA: chat que terminou e não tem mais nada (nenhum /run aberto, engine ocioso, sem
+ * trabalho em background) FECHA o processo na hora — a RAM volta pros outros chats (dono,
+ * 2026-10-18: "assim dá pra ter uma rotação quase infinita de chats"). A sessão fica no disco: a
+ * próxima mensagem volta nela (claude --resume, codex thread/resume). Box própria não: ela pausa
+ * inteira quando fica ociosa e a pausa já libera a RAM (e volta quente).
+ */
+function releaseIfIdle(lane) {
+	if (lane.releasing) return;
+	lane.releasing = (async () => {
+		for (const e of lane.engines.values()) {
+			if (lane.openRuns === 0 && e.alive() && e.idle()) await e.close('idle_release', { keepSession: true });
+		}
+	})().catch((err) => logError('idle release failed', { lane: lane.key, msg: err && err.message })).finally(() => { lane.releasing = null; });
+}
+
 async function runMessage(lane, envelope, relay, emit) {
 	if (!envelope.prompt) throw new Error('prompt required for mode=cc-cli');
+	// a pista estava fechando o processo ocioso bem agora: espera e sobe de novo (na mesma sessão)
+	if (lane.releasing) await lane.releasing;
 	const kind = engineKindOf(envelope);
 	const cap = envelope.backgroundWaitMs || BACKGROUND_CAP_MS;
 	// UMA conversa, um engine por vez: trocar de provedor espera o outro terminar o que faz
@@ -187,6 +205,7 @@ async function handleRun(req, res) {
 			if (out && out.ok === false) logError('save callback failed', { status: out.status, error: out.error });
 		} catch (e) { logError('relay.complete threw', { msg: e && e.message }); }
 		relays.closed(relay);
+		if (lane.shared && mode === 'cc-cli') releaseIfIdle(lane);
 	}
 }
 
@@ -218,7 +237,10 @@ function handleStream(req, res) {
 const server = http.createServer(async (req, res) => {
 	if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
 		// aberto (probes de prontidão). busyChats: chats com /run aberto (rodando ou segurando background)
-		json(res, 200, { status: 'ok', inFlight: openRuns > 0, busyChats: [...lanes.values()].filter((l) => l.openRuns > 0).map((l) => l.lastChatId || l.key) });
+		// engines: quais chats têm processo de engine VIVO (box compartilhada: só os que estão trabalhando)
+		const engines = {};
+		for (const l of lanes.values()) { const live = [...l.engines.values()].filter((e) => e.alive()).map((e) => e.kind); if (live.length) engines[l.lastChatId || l.key] = live; }
+		json(res, 200, { status: 'ok', inFlight: openRuns > 0, busyChats: [...lanes.values()].filter((l) => l.openRuns > 0).map((l) => l.lastChatId || l.key), engines });
 		return;
 	}
 	const isStreamGet = req.method === 'GET' && (req.url === '/stream' || req.url.startsWith('/stream?'));

@@ -274,6 +274,7 @@ class ClaudeEngine extends Engine {
 		const live = this.turn || this.continuing;
 		if (!this.alive() || !live) return { interrupted: false, promptIds: [], engine: 'claude' };
 		const promptIds = live.promptIds();
+		live.stopped = true; // o result que vier agora é do STOP, não erro do provedor
 		const ack = await this.control({ subtype: 'interrupt' }, 3000);
 		const t0 = nowMs();
 		while ((this.turn === live || this.continuing === live) && nowMs() - t0 < 3000) await sleep(100);
@@ -344,6 +345,12 @@ class ClaudeEngine extends Engine {
 		if (!target) return;
 
 		if (target === this.turn) this.turnPhases(target, type);
+		// turno parado pelo STOP: o claude devolve o texto parcial marcado como erro — pro Worker e pro
+		// app isso é PARADO (o que já saiu no stream fica como resposta), não falha do provedor
+		if (type === 'result' && target.stopped && !target.done) {
+			o.subtype = 'error_during_execution'; o.is_error = true; o.result = '';
+			line = JSON.stringify(o);
+		}
 		target.relay.write(line + '\n');
 
 		if (type === 'result') {

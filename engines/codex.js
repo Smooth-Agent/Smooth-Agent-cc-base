@@ -399,7 +399,8 @@ class CodexEngine extends Engine {
 			output_tokens: total ? Math.max(0, total.outputTokens - ((start && start.outputTokens) || 0)) : 0,
 		};
 		const failed = status === 'failed';
-		const text = failed && turn.error ? String(turn.error.message || 'codex error') : t.lastText;
+		// interrompido (STOP): sem texto — o que já saiu no stream fica como resposta (o Worker trata)
+		const text = status === 'interrupted' ? '' : failed && turn.error ? String(turn.error.message || 'codex error') : t.lastText;
 		// rotação do codex ANTES de fechar o turno (o refresh token é de uso único)
 		try { await this.flushCredentials(); } catch { /* nunca derruba o turno */ }
 		t.write({ type: 'result', subtype: status === 'completed' ? 'success' : status === 'interrupted' ? 'error_during_execution' : 'error', is_error: status !== 'completed', result: text, ...(this.threadId ? { session_id: this.threadId } : {}), usage });
