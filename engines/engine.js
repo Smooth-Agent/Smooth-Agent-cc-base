@@ -99,8 +99,9 @@ class Engine {
 	async close(_reason, _opts) {}
 	/** Trabalho DENTRO do engine que o /proc não vê (o turno espera). */
 	workInEngine(_turn) { return 0; }
-	/** Sessão/marcador/pid pra achar os processos do turno (lib/turn-quiet). */
-	processInfo() { return { sid: null, mark: null, pid: null }; }
+	/** Sessão/marcador/pid pra achar os processos do turno (lib/turn-quiet). `ignore(name)` = processos
+	 *  PERMANENTES do engine (ele sobe auxiliares próprios) — não são trabalho do turno. */
+	processInfo() { return { sid: null, mark: null, pid: null, ignore: null }; }
 	/** Tem processo vivo (rotação por memória só fecha engine ocioso). */
 	alive() { return false; }
 

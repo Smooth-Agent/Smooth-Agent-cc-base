@@ -116,7 +116,9 @@ class CodexEngine extends Engine {
 	get threadFile() { return path.join(this.lane.codexHome, 'smooth-thread.json'); }
 	alive() { return !!this.proc && this.proc.exitCode === null; }
 	pendingCount() { return this.inflight ? 1 : 0; }
-	processInfo() { return { sid: this.proc ? this.proc.pid : null, mark: this.mark, pid: this.proc ? this.proc.pid : null }; }
+	// o app-server sobe auxiliares PERMANENTES dele (ex.: `codex-code-mode`, provado em 2026-10-18 com a
+	// sub real: segurava o 1º turno até o teto) — não são trabalho do turno; comandos do agente não se chamam codex*
+	processInfo() { return { sid: this.proc ? this.proc.pid : null, mark: this.mark, pid: this.proc ? this.proc.pid : null, ignore: (name) => /^codex/.test(name) }; }
 
 	static signature(e) {
 		const authKind = e.codexAuth ? 'sub' : 'key';

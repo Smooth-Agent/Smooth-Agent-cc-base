@@ -102,7 +102,7 @@ async function runMessage(lane, envelope, relay, emit) {
 	const info = engine.processInfo();
 	const quiet = await waitTurnQuiet(emit, cap, {
 		sid: info.sid, mark: info.mark, since: turn.since, get until() { return turn.until; },
-		exceptPid: info.pid, useCgroup: lanes.size <= 1, working: () => engine.workInEngine(turn),
+		exceptPid: info.pid, ignore: info.ignore || null, useCgroup: lanes.size <= 1, working: () => engine.workInEngine(turn),
 	});
 	relay.backgroundLeft = quiet.left.length;
 	// quem entrou no turno (até durante a continuação) vai junto no salvamento da dona
